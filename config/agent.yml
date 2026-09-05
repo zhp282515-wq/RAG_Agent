@@ -1,0 +1,9 @@
+# agent 会话(窗口)与记忆相关配置
+session:
+  # 会话历史按会话窗口存入 MySQL 库 agent_sessions(见 utils/mysql_tool.py),
+  # 由 .env 的 MYSQL_DATABASE 指定库名入口(默认 agent_sessions)。
+  auto_init_db: true          # 首次使用时自动建库建表(幂等)
+  max_image_bytes: 10485760   # 单张图片大小上限 10MB
+  upload_dir: data\uploads    # 本地上传图片默认落盘目录
+
+user_data_path: data\external\records.csv

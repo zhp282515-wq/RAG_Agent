@@ -1,0 +1,35 @@
+# ---- 敏感配置 ----
+.env
+.env.*
+!.env.example
+
+# ---- 虚拟环境 / 构建产物 ----
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# ---- 本地工具配置(含本机绝对路径) ----
+.claude/
+
+# ---- IDE / 系统 ----
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+.DS_Store
+
+# ---- 运行时数据:上传文件、用户数据、向量库卷、日志 ----
+data/uploads/
+data/external/
+data/
+volumes/
+logs/
+attu
+
+# 模型权重等大文件(如未来加入)
+model/*.gguf
+model/*.safetensors
+model/*.bin

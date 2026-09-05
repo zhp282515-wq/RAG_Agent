@@ -1,0 +1,23 @@
+[project]
+name = "rag-agent"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+dependencies = [
+    "langchain",
+    "langchain-community",
+    "langchain-text-splitters",
+    "langchain-openai",
+    "langgraph",
+    "python-dotenv",
+    "pymupdf>=1.28.2",
+    "python-docx>=1.2.0",
+    "openai>=3.7.0",
+    "pandas>=3.0.5",
+    "openpyxl>=3.1.5",
+    "xlrd>=2.0.2",
+    "rich>=15.0.0",
+    "pymysql>=1.2.0",
+    "orjson>=3.12.0",
+    "langgraph-checkpoint-mysql==2.0.17",
+]

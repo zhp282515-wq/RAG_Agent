@@ -1,0 +1,8 @@
+model: openai:qwen3.8-flash
+emb_model: qwen3.7-text-embedding-flash
+
+rerank_model: qwen3.7-text-rerank
+
+vlm_model: qwen-vl-plus
+vlm_max_tokens: 800
+vlm_retries: 3

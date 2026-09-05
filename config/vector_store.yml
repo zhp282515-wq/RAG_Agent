@@ -1,0 +1,16 @@
+chunk_size: 500
+chunk_overlap: 100
+separators: ["\n", "。", "！", "？", "；", ""]
+
+# Milvus 连接与集合参数
+milvus_uri: "http://127.0.0.1:19530"
+collection_name: "document_chunks"
+dim: 1024
+
+# PDF 解析:true=布局感知解析(标题/表格/页眉页脚/溯源),false=旧版简单提取
+pdf_layout: true
+
+# 检索参数
+top_k: 20
+rerank_n: 5
+

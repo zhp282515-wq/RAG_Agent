@@ -131,6 +131,7 @@ RAG_Agent/
 ├── vector_store/vector_store.py    # Milvus 连接/建库、解析→分片→入库、粗排+精排检索
 ├── model/modelfactory.py           # 对话/向量/Rerank/VLM 模型工厂
 ├── utils/                          # MySQL、会话存储、文件解析、图片、VLM、日志、配置
+│   └── eval_rerank.py              # ±Rerank 检索对照评测(115 问集,可复跑)
 ├── config/                         # agent / model / rag / vector_store 的 YAML 配置
 ├── prompts/                        # 系统提示词 & 报告提示词
 ├── web/

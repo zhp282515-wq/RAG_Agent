@@ -4,10 +4,25 @@
    ============================================ */
 
 const DebugUI = {
+  /** 进入调试页时用全局 top_k/达标线预填(可再手动改;调试改的 top_k 仅本次临时覆盖,不写库) */
+  async prefill() {
+    try {
+      const d = await API.get("/api/settings");
+      const topk = document.getElementById("debug-topk");
+      const box = document.getElementById("debug-results");
+      if (topk && d.retrieval && topk.value === "20" && !topk.dataset.touched) {
+        topk.value = d.retrieval.top_k;
+      }
+      if (box && d.retrieval) box.dataset.scoreMin = d.retrieval.score_min;
+    } catch (_) { /* 忽略:保持默认 */ }
+  },
+
   async search() {
     const query = document.getElementById("debug-query").value.trim();
     if (!query) return;
-    const topK = parseInt(document.getElementById("debug-topk").value) || 20;
+    const topkInput = document.getElementById("debug-topk");
+    if (topkInput) topkInput.dataset.touched = "1"; // 记录用户手动改过,不再预填覆盖
+    const topK = parseInt(topkInput.value) || 20;
     const box = document.getElementById("debug-results");
     box.innerHTML = `<p class="muted">检索中…</p>`;
     try {
@@ -21,7 +36,8 @@ const DebugUI = {
   render(hits) {
     const box = document.getElementById("debug-results");
     if (!hits.length) {
-      box.innerHTML = `<p class="muted">无相关命中(相关度低于 0.60 的条目不返回)</p>`;
+      const sm = Number(box.dataset.scoreMin || 0.6).toFixed(2);
+      box.innerHTML = `<p class="muted">无相关命中(相关度低于 ${sm} 的条目不返回)</p>`;
       return;
     }
     box.innerHTML = hits.map((h, i) => `

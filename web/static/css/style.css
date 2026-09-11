@@ -281,6 +281,11 @@ input[type="file"].wallpaper-input { display: none; }
 .btn-liquid:disabled { opacity: .5; cursor: not-allowed; transform: none; }
 
 #btn-new-session {
+  width: 100%;                 /* 占满会话栏宽度,按钮完整不被截断 */
+  display: flex;               /* 图标+文字 水平/垂直居中 */
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
   height: 46px;
   border-radius: 12px;
   font-size: 14px;
@@ -288,6 +293,7 @@ input[type="file"].wallpaper-input { display: none; }
   cursor: pointer;
   border: 1px solid rgba(255, 255, 255, 0.45);
 }
+#sidebar-sessions { display: flex; flex-direction: column; gap: 12px; min-height: 0; flex: 1; }
 
 .session-search {
   display: flex; align-items: center; gap: 8px;
@@ -377,44 +383,8 @@ input[type="file"].wallpaper-input { display: none; }
 }
 body.dark .session-rename-input { background: rgba(30, 42, 74, 0.8); }
 
-/* 侧边栏底部用户区 */
-#sidebar-user {
-  display: flex; align-items: center; gap: 10px;
-  padding: 12px;
-  border-radius: 14px;
-  background: var(--glass-chip);
-  backdrop-filter: var(--blur);
-  -webkit-backdrop-filter: var(--blur);
-  border: 1px solid var(--glass-border);
-  box-shadow: var(--glass-inner-glow);
-  flex-shrink: 0;
-  position: relative;
-}
 /* 设置/内容弹窗主体与滑块 */
 .modal-body { padding: 18px 20px; }
-/* 设置齿轮下拉菜单 */
-.settings-menu-wrap { position: relative; display: inline-flex; }
-.dropdown-menu {
-  position: absolute;
-  right: 0; bottom: calc(100% + 8px);
-  min-width: 150px;
-  background: var(--glass-l1);
-  backdrop-filter: var(--blur);
-  -webkit-backdrop-filter: var(--blur);
-  border: 1px solid var(--glass-border);
-  box-shadow: var(--glass-inner-glow), var(--glass-shadow);
-  border-radius: 12px;
-  padding: 5px;
-  z-index: 60;
-}
-.dropdown-item {
-  display: flex; align-items: center; gap: 8px;
-  width: 100%; text-align: left;
-  padding: 9px 12px; border: none; background: transparent; cursor: pointer;
-  font-size: 13px; color: var(--text-main); border-radius: 8px;
-  transition: background var(--ease);
-}
-.dropdown-item:hover { background: rgba(255, 255, 255, 0.26); }
 .settings-title {
   display: flex; align-items: center; gap: 6px;
   font-size: 13px; font-weight: 600; margin-bottom: 12px;
@@ -433,14 +403,6 @@ input.slider-full {
   width: 100%; accent-color: var(--accent); cursor: pointer;
 }
 .setting-hint { font-size: 12px; color: var(--text-faint); margin-top: 12px; }
-.sidebar-user-info { flex: 1; min-width: 0; }
-.sidebar-user-name { font-size: 13px; font-weight: 600; }
-.sidebar-user-plan {
-  font-size: 11px; color: var(--accent);
-  background: rgba(60, 120, 255, 0.14);
-  border-radius: 8px; padding: 0 7px;
-  display: inline-block; margin-top: 2px;
-}
 
 /* ============ Level 2:主内容区 ============ */
 #content {
@@ -590,19 +552,17 @@ body.dark .msg.assistant .md-body pre { background: rgba(255, 255, 255, 0.06); }
 
 .msg-img { max-width: 160px; max-height: 160px; border-radius: 12px; margin-bottom: 6px; border: 1px solid var(--glass-border); }
 .msg-actions { display: flex; gap: 6px; margin-top: 8px; align-items: center; }
-/* 消息操作:纯图标按钮,悬停才显示文字名 */
+/* 消息操作:纯图标(无背景),悬停显示文字名 + 图标着色 */
 .msg-actions button {
   position: relative;
-  border: none; background: var(--glass-chip);
-  color: var(--text-muted);
+  border: none; background: transparent;
+  color: var(--text-faint);
   cursor: pointer; font-size: 12px;
-  width: 28px; height: 28px;
-  border-radius: 8px;
+  width: 24px; height: 24px;
   display: inline-flex; align-items: center; justify-content: center;
-  border: 1px solid transparent;
-  transition: background var(--ease), color var(--ease), transform var(--ease);
+  transition: color var(--ease), transform var(--ease);
 }
-.msg-actions button:hover { color: var(--accent); background: rgba(255, 255, 255, 0.44); transform: translateY(-1px); }
+.msg-actions button:hover { color: var(--accent); transform: translateY(-1px); }
 .msg-actions button::after {
   content: attr(title);
   position: absolute; top: -26px; left: 50%;
@@ -617,6 +577,33 @@ body.dark .msg.assistant .md-body pre { background: rgba(255, 255, 255, 0.06); }
 .msg-actions button:hover::after { opacity: 1; }
 .cursor-blink { display: inline-block; width: 8px; height: 14px; background: var(--accent); animation: blink 1s infinite; vertical-align: -2px; }
 @keyframes blink { 50% { opacity: 0; } }
+
+/* 生成中动态指示徽标(位于回答卡片内、正文气泡之后:当前动作 + 总计时) */
+.ls-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--text-muted);
+  vertical-align: middle;
+  white-space: nowrap;
+}
+.ls-spinner {
+  width: 10px; height: 10px;
+  border: 2px solid rgba(60, 120, 255, 0.25);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  display: inline-block;
+  animation: wf-spin 1.2s linear infinite;
+  flex-shrink: 0;
+}
+.ls-text { overflow: hidden; text-overflow: ellipsis; }
+.ls-time {
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
 
 /* ============ Level 3:底部输入框 ============ */
 #chat-input-wrap { padding-top: 6px; flex-shrink: 0; }
@@ -680,9 +667,35 @@ body.dark .msg.assistant .md-body pre { background: rgba(255, 255, 255, 0.06); }
 }
 /* ============ 模型选择(自定义毛玻璃下拉) ============
    原生 <select> 的下拉列表是系统渲染、无法加毛玻璃,故改用自定义按钮+菜单。
-   触发按钮:与发送按钮同排的玻璃胶囊;展开菜单:毛玻璃浮层(与设置下拉同质感)。
-   注意:位于带 backdrop-filter 的 #chat-input-box 内,菜单/按钮需自身 backdrop;
-   backdrop-filter 在边缘可能产生色带,故底色偏实 + 高饱和 blur 弱化伪影。 */
+   聊天输入框内仅剩「当前模型」只读徽标(模型切换收敛到系统配置页);点击徽标
+   「切换」跳去系统配置 → 对话模型。 */
+.chat-model-badge {
+  display: inline-flex; align-items: center; gap: 6px;
+  align-self: center; flex-shrink: 0;
+  padding: 6px 6px 6px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.45);
+  background-color: rgba(255, 255, 255, 0.22);
+  color: var(--text-main);
+  font-size: 12px; font-family: inherit; font-weight: 500;
+  border-radius: 999px;
+  cursor: pointer;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5);
+  transition: background-color var(--ease), border-color var(--ease);
+}
+.chat-model-badge:hover { background-color: rgba(255, 255, 255, 0.34); border-color: rgba(60, 120, 255, 0.55); }
+.chat-model-badge .chat-model-goto {
+  font-size: 11px; color: var(--accent);
+  background: rgba(60, 120, 255, 0.14);
+  border-radius: 999px; padding: 2px 8px;
+  font-weight: 600;
+}
+body.dark .chat-model-badge {
+  background-color: rgba(24, 32, 56, 0.5);
+  border-color: #38445e;
+}
+body.dark .chat-model-badge:hover { background-color: #26334f; border-color: #4a5a82; }
+
+/* 模型下拉容器(供系统配置页;聊天页已改只读徽标) */
 .model-picker { position: relative; flex-shrink: 0; align-self: center; }
 .model-picker-btn {
   display: inline-flex; align-items: center; gap: 5px;
@@ -1150,4 +1163,161 @@ body.dark .modal-box { background: rgba(28, 36, 64, 0.66); }
   width: 6px;
 }
 body.dark ::-webkit-scrollbar-thumb { background: rgba(150, 170, 205, 0.3); background-clip: padding-box; }
+
+/* ============ 系统配置页(左子栏 + 右面板) ============ */
+#view-config { overflow-y: auto; padding-bottom: 24px; }
+#view-config .config-panel { display: none; }
+#view-config .config-panel.active { display: flex; flex-direction: column; }
+.config-global-note {
+  font-size: 12px; color: var(--accent);
+  background: rgba(60, 120, 255, 0.10);
+  border-radius: 8px; padding: 3px 9px;
+}
+.config-body { display: flex; flex-direction: column; gap: 16px; flex: 1; min-height: 0; }
+
+/* 左子栏 */
+#sidebar-config { display: flex; flex-direction: column; gap: 6px; min-height: 0; overflow-y: auto; flex: 1; }
+.sidebar-config-title {
+  font-size: 13px; font-weight: 600; color: var(--text-faint);
+  padding: 2px 10px 8px; letter-spacing: 0.4px;
+}
+.sidebar-config-nav { display: flex; flex-direction: column; gap: 2px; }
+.sidebar-config-item {
+  display: flex; align-items: center; gap: 10px; text-align: left;
+  padding: 10px 12px; border-radius: 10px;
+  background: transparent; border: none; cursor: pointer;
+  color: var(--text-main); font-size: 13.5px; font-weight: 500;
+  transition: background var(--ease), transform var(--ease);
+  width: 100%;
+}
+.sidebar-config-item .ic { width: 16px; height: 16px; color: var(--text-muted); flex-shrink: 0; }
+.sidebar-config-item:hover { background: rgba(255, 255, 255, 0.24); }
+.sidebar-config-item.active { background: rgba(255, 255, 255, 0.32); color: var(--accent); box-shadow: inset 0 1px 0 rgba(255,255,255,0.5); }
+.sidebar-config-item.active .ic { color: var(--accent); }
+body.dark .sidebar-config-item:hover { background: rgba(255, 255, 255, 0.08); }
+body.dark .sidebar-config-item.active { background: rgba(255, 255, 255, 0.12); }
+
+/* 设置卡片 */
+.cfg-card {
+  background: rgba(255, 255, 255, 0.18);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-md);
+  padding: 16px 18px;
+  box-shadow: var(--glass-inner-glow);
+}
+body.dark .cfg-card { background: rgba(20, 30, 55, 0.32); }
+.cfg-card-title {
+  font-size: 13px; font-weight: 600; color: var(--text-muted);
+  margin-bottom: 14px; letter-spacing: 0.3px;
+}
+.cfg-actions {
+  display: flex; align-items: center; gap: 12px; margin-top: 4px;
+}
+.cfg-actions .btn-liquid { padding: 8px 18px; border-radius: 10px; }
+.btn-ghost {
+  background: rgba(255,255,255,0.22); color: var(--text-main);
+  border: 1px solid var(--glass-border); border-radius: 10px;
+  padding: 8px 16px; cursor: pointer; font-size: 13px;
+  transition: background var(--ease);
+}
+.btn-ghost:hover { background: rgba(255,255,255,0.34); }
+.cfg-feedback { font-size: 12px; margin-left: 4px; }
+.cfg-feedback.cfg-ok { color: #2f9e6e; }
+
+/* 外观设置弹窗:分隔线 + 壁纸操作行 */
+.appearance-divider {
+  height: 1px; margin: 18px 0 14px;
+  background: rgba(120, 140, 175, 0.2);
+}
+.wallpaper-actions { display: flex; gap: 10px; margin-bottom: 4px; }
+.wallpaper-actions .btn-ghost { display: inline-flex; align-items: center; gap: 6px; padding: 7px 14px; border-radius: 10px; }
+
+/* 输入类 */
+input.slider-full.cfg-num {
+  background: rgba(255,255,255,0.4); border: 1px solid var(--glass-border);
+  border-radius: 8px; padding: 6px 10px; width: 120px; color: var(--text-main);
+  accent-color: var(--accent);
+}
+input.cfg-txt {
+  background: rgba(255,255,255,0.4); border: 1px solid var(--glass-border);
+  border-radius: 8px; padding: 8px 10px; color: var(--text-main); width: 100%;
+  font-size: 13px; box-sizing: border-box; margin-bottom: 12px;
+}
+body.dark input.cfg-txt, body.dark input.slider-full.cfg-num { background: rgba(30,42,74,0.5); color: #e8edf7; }
+
+/* 工具行 */
+.tool-row {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; padding: 10px 2px; border-bottom: 1px solid rgba(120,140,175,0.16);
+}
+.tool-row:last-child { border-bottom: none; }
+.tool-row-main { min-width: 0; }
+.tool-row-title { display: flex; align-items: center; gap: 8px; font-size: 13.5px; font-weight: 600; }
+.cfg-key { color: var(--text-faint); font-size: 11.5px; font-weight: 400; background: rgba(120,140,175,0.14); padding: 1px 7px; border-radius: 6px; }
+.cfg-note { display: block; font-size: 12px; margin-top: 3px; }
+.cfg-loc { font-size: 12px; margin-top: 3px; max-width: 520px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tool-row-ops { display: flex; align-items: center; gap: 8px; }
+.btn-del-ext { color: var(--text-faint); }
+.btn-del-ext:hover { color: #D64545; background: rgba(214,69,69,0.14); }
+.btn-edit-ext { color: var(--text-faint); }
+.btn-edit-ext:hover { color: var(--accent); background: rgba(60,120,255,0.14); }
+
+/* 开关(拨动) */
+.switch { position: relative; display: inline-block; width: 40px; height: 22px; flex-shrink: 0; }
+.switch input { opacity: 0; width: 0; height: 0; }
+.switch-slider {
+  position: absolute; cursor: pointer; inset: 0;
+  background: rgba(120,140,175,0.38); border-radius: 22px;
+  transition: background var(--ease);
+}
+.switch-slider::before {
+  content: ""; position: absolute; width: 16px; height: 16px; left: 3px; top: 3px;
+  background: #fff; border-radius: 50%;
+  box-shadow: 0 2px 5px rgba(20,40,70,0.25);
+  transition: transform var(--ease);
+}
+.switch input:checked + .switch-slider { background: var(--accent); }
+.switch input:checked + .switch-slider::before { transform: translateX(18px); }
+
+/* 新增外部工具弹窗 */
+.cfg-radio-row { display: flex; gap: 18px; margin-bottom: 12px; }
+.cfg-radio { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-main); cursor: pointer; }
+.cfg-radio input { accent-color: var(--accent); }
+.modal-foot {
+  display: flex; justify-content: flex-end; gap: 10px;
+  padding: 14px 16px; border-top: 1px solid rgba(120,140,175,0.16);
+}
+.modal-foot .btn-liquid { border-radius: 10px; padding: 8px 18px; }
+.modal-foot .btn-ghost { border-radius: 10px; }
+.cfg-model-picker { margin-bottom: 12px; }
+/* 系统配置页的模型下拉:按钮在卡片内、下方有空间 → 菜单展开到按钮下方(默认样式是向上) */
+.cfg-model-picker .model-picker-menu {
+  top: calc(100% + 8px);
+  bottom: auto;
+  left: 0;
+  right: auto;
+  min-width: 200px;
+}
+.cfg-model-picker .model-picker-btn {
+  border-radius: 10px;
+  padding: 8px 14px;
+  font-size: 13px;
+}
+
+/* 配置面板弹窗滚动:内部区域可滚,底部操作栏固定 */
+#view-config .config-body { overflow-y: auto; }
+.cfg-ext-toolbar {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 6px; gap: 10px;
+}
+.cfg-ext-toolbar .btn-liquid { padding: 7px 14px; font-size: 12.5px; border-radius: 9px; }
+#cfg-tools-external .fmt-badge { font-size: 10.5px; padding: 1px 6px; }
+
+/* 系统配置 · API Key 卡片 */
+.cfg-apikey-row { display: flex; align-items: center; gap: 10px; }
+.cfg-apikey-row input.cfg-txt { margin-bottom: 0; }
+.cfg-apikey-state { flex-shrink: 0; font-size: 12px; white-space: nowrap; }
+.cfg-apikey-state.cfg-ok { color: #2f9e6e; }
+.cfg-apikey-actions { display: flex; gap: 10px; margin-top: 12px; }
+.cfg-apikey-actions .btn-ghost { display: inline-flex; align-items: center; gap: 6px; padding: 7px 14px; border-radius: 10px; }
 body.dark ::-webkit-scrollbar-thumb:hover { background: rgba(120, 150, 200, 0.5); background-clip: padding-box; }

@@ -40,8 +40,8 @@ def describe_image(
     img_bytes: bytes,
     mime: str = "png",
     prompt: str | None = None,
-    api_key: str | None = os.getenv("DASHSCOPE_API_KEY"),
-    base_url: str | None = os.getenv("DASHSCOPE_BASE_URL"),
+    api_key: str | None = None,
+    base_url: str | None = None,
 ) -> str:
     """把单张图片转成文字描述。
 
@@ -49,6 +49,7 @@ def describe_image(
         img_bytes: 图片原始字节
         mime: 图片格式（png / jpeg 等），用于构造 data URL
         prompt: 可选的自定义描述要求
+        api_key: 显式传入则用之;缺省取「系统配置」DB key,回退 .env
 
     Returns:
         图片的文字描述；无 API key 或调用失败时返回占位文本，不抛异常。
@@ -62,16 +63,22 @@ def describe_image(
     if img_hash in _cache:
         return _cache[img_hash]
 
-    api_key = api_key
+    # 未显式传 key → 取当前生效 key(DB 优先,回退 .env)
     if not api_key:
-        logger.warning("describe_image: 缺少 DASHSCOPE_API_KEY，跳过图片描述")
+        try:
+            from utils.settings_store import get_dashscope_key
+            api_key = get_dashscope_key()
+        except Exception:
+            api_key = ""
+    if not api_key:
+        logger.warning("describe_image: 缺少 DashScope API Key(系统配置未填),跳过图片描述")
         return "[图片：缺少API密钥，未生成描述]"
 
     from openai import OpenAI
 
     client = OpenAI(
         api_key=api_key,
-        base_url=base_url,
+        base_url=base_url or os.getenv("DASHSCOPE_BASE_URL"),
     )
 
     b64 = base64.b64encode(img_bytes).decode()

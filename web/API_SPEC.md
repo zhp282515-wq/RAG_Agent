@@ -94,9 +94,10 @@ SSE 事件与聊天相同(可含 trace/sources/token/done/error)。
 ```json
 {"hits": [{"score": 0.93, "label": "高", "file_name": "x.pdf", "page": 3, "chapter": "…", "section": "…", "text": "正文(截断至500字)"}]}
 ```
-- label:score≥0.85 高 / ≥0.60 中;<0.60 不返回。
+- label:≥高相关线(默认 0.85)高 / ≥达标线(默认 0.60)中;<达标线不返回。两阈值可经「系统配置」全局调整,检索调试结果跟随全局。
 - 无命中:`{"hits": []}`。
-- 后端:`VectorStoreService().search(query, top_k)` 后按阈值过滤并标注等级。
+- top_k:请求体提供为**临时覆盖**(不写库、仅本次);缺省回退全局默认(系统配置,原 20)。
+- 后端:`VectorStoreService().get_rerank_retriever(top_k, rerank_n)` 后按全局达标线过滤并标注等级。
 
 ## 6. 文档管理(知识库页)
 
@@ -149,6 +150,75 @@ file_name 需 URL 编码。
 不存在 404。
 
 > 下载:前端用 Blob 在浏览器本地导出 .md(后端无需下载接口)。
+
+## 8. 系统配置(系统配置页,MySQL app_settings)
+设置存 `app_settings` 表(skey / value_json)。服务端在**每次检索 / 构建 agent 前现读**,
+改完「下次提问即生效」,无需重启。
+
+### GET /api/settings
+读全部可配置项 + 可选模型清单 + API Key 是否已配置(不返回明文/密文)。
+```json
+{
+  "settings": {"retrieval.top_k":20,"retrieval.rerank_n":5,"retrieval.score_high":0.85,
+               "retrieval.score_min":0.6,"model.default":"qwen3.8-flash","model.temperature":0.7},
+  "model_default": "qwen3.8-flash",
+  "temperature": 0.7,
+  "api_key_configured": true,
+  "retrieval": {"top_k":20,"rerank_n":5,"score_high":0.85,"score_min":0.6},
+  "models": ["qwen3.8-flash","qwen3.8-max","qwen3-vl-flash","qwen3-vl-plus"]
+}
+```
+
+### PUT /api/settings
+写检索三件套 / 默认模型 / 温度 / API Key。支持整段或分项:
+```json
+{"retrieval":{"top_k":25,"rerank_n":6,"score_high":0.9,"score_min":0.65}}
+{"model":{"default":"qwen3.8-max","temperature":0.5}}
+{"model":{"api_key":"sk-…"}}    // 写 DashScope API Key(加密落库,供 聊天/向量/精排/图片 全部服务)
+{"model":{"api_key":""}}        // 清除 DB key,回退 .env 的 DASHSCOPE_API_KEY
+```
+- 校验:top_k/rerank_n 1~100;score_high>0;score_min∈[0,1);temperature∈[0,2]。非法返回 400。
+- `api_key` 不回读明文;GET 只返回 `api_key_configured` 布尔。
+- 响应 `{"ok": true}`。
+
+### API Key 门槛
+`POST /api/chat`、`POST /api/report`、`POST /api/documents` 在**未配置任何可用 API Key**
+(DB key 与 .env 均无)时返回 `403`:
+`未配置模型服务 API Key,请先在「系统配置 → 对话模型」填入 API Key 后再使用`。
+
+## 9. 工具(系统配置 → 工具,MySQL tool_registry)
+可插拔工具注册表:7 个内置工具默认全开、可独立启停;外部 MCP 工具(stdio/http)注册挂载。
+工具启停/注册变化会 bump 服务端 agent 缓存版本 → **下次提问自动重建 agent**(新工具集生效)。
+
+### GET /api/tools
+```json
+{"tools":[
+  {"key":"get_rerank_retriever","kind":"builtin","label":"知识库检索","group":"检索","enabled":true,
+   "default_enabled":true,"description":"…","note":"关闭将禁用知识库检索(无 RAG 问答)","config":{},"transport":""},
+  {"key":"math_tools","kind":"external","label":"数学计算工具","enabled":true,"transport":"stdio",
+   "config":{"command":"…","args":["…"]}}
+],"rev":4}
+```
+
+### PUT /api/tools/{key}
+开/关任意工具(内置或外部):body `{"enabled":true|false}`。未知 404;成功 `{"ok":true,"rev":N}`。
+
+### POST /api/tools(注册外部 MCP 工具)
+```json
+{"key":"math_tools","label":"数学计算工具","transport":"stdio",
+ "config":{"command":"C:/…/python.exe","args":["D:/server.py"]}}
+// http:
+{"key":"srv","label":"…","transport":"http","config":{"url":"https://…"}}
+```
+- key 限 `[A-Za-z0-9_]{1,64}`,不能是内置工具名 / 重复 → 400。
+- 注册前做**短超时连通探测**(起 MCP 会话列工具),失败 400 不落库。
+- 成功:落库(enabled=1)+ bump rev,返回 `{"ok":true,"rev":N,"mcp_tools":[{name,description,args}]}`。
+
+### DELETE /api/tools/{key}
+仅外部工具可删;内置 → 400;不存在 → 404。成功 `{"ok":true,"rev":N}`。
+
+> 外部工具错误处理:挂载的外部 MCP 工具会被统一包装,异常/重试后返回 `@@TOOL_ERROR@@`
+> 结构化文本(与内置工具一致),让模型按「建议」修正/如实告知,不裸奔 langchain 错误。
 
 ## 附:前端行为约定(后端需知晓)
 

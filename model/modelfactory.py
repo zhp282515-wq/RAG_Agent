@@ -13,6 +13,12 @@ import os
 import json
 import urllib.request
 
+# 当前生效的 DashScope API Key:DB「系统配置」填的 key 优先,否则回退 .env。
+# 每个服务在真正要发请求时才读(而非 import 时读死),使改 key「下次提问即生效」。
+def dashscope_api_key() -> str:
+    from utils.settings_store import get_dashscope_key
+    return get_dashscope_key()
+
 class BaseModelService(ABC):
     """模型服务的基类"""
     @abstractmethod
@@ -21,40 +27,55 @@ class BaseModelService(ABC):
 
 class ChatModelService(BaseModelService):
     """聊天模型服务"""
-    def get_model_service(self, model=model_conf["model"], api_key=os.getenv("DASHSCOPE_API_KEY"), base_url=os.getenv("DASHSCOPE_BASE_URL")) -> _ConfigurableModel:
-        return init_chat_model(
-            model=model or None,
-            api_key=api_key or None,
-            base_url=base_url or None,
-        )
+    def get_model_service(self, model=model_conf["model"],
+                          api_key: str | None = None,
+                          base_url: str | None = None,
+                          temperature: float | None = None) -> _ConfigurableModel:
+        # key 未显式传入 → 取当前生效 key(DB 优先,回退 .env)
+        if api_key is None:
+            api_key = dashscope_api_key()
+        if base_url is None:
+            base_url = os.getenv("DASHSCOPE_BASE_URL")
+        kw = {"model": model or None, "api_key": api_key or None, "base_url": base_url or None}
+        if temperature is not None:
+            kw["temperature"] = temperature
+        return init_chat_model(**kw)
 
 
-def get_chat_model(model: str) -> _ConfigurableModel:
+def get_chat_model(model: str, temperature: float | None = None) -> _ConfigurableModel:
     """按模型名建聊天模型(web 前端可在 qwen3.x 系列间切换)。
 
     模型名可能是裸名(qwen3.8-flash)或带 provider(openai:qwen3.8-flash)。
     DashScope 走 OpenAI 兼容端点,裸名无法被 init_chat_model 推断 provider,
     这里统一补 openai: 前缀,确保真正切到目标模型而非静默回退默认。
+    temperature: 可选,透传给 init_chat_model(系统配置页可改)。
     """
     name = str(model or "").strip()
     if not name:
         raise ValueError("model 不能为空")
     if ":" not in name:
         name = f"openai:{name}"
-    return ChatModelService().get_model_service(model=name)
+    return ChatModelService().get_model_service(model=name, temperature=temperature)
 
 class EmbeddingModelService(BaseModelService):
     """嵌入模型服务"""
     def get_model_service(self) -> OpenAI:
-        return self.client
+        return self._client()
 
     def __init__(self, model: str = model_conf["emb_model"], dimensions: int = 1024):
-        self.client = OpenAI(
-            api_key=os.getenv("DASHSCOPE_API_KEY"),
-            base_url=os.getenv("DASHSCOPE_BASE_URL"),
-        )
-        self.model = model
-        self.dimensions = dimensions
+        self._model = model
+        self._dimensions = dimensions
+        self._client_cache: tuple[str, OpenAI] | None = None  # (key, client)
+
+    def _client(self) -> OpenAI:
+        """按当前生效 key 取客户端(key 变化时重建,使改 key 后无需重启)。"""
+        key = dashscope_api_key()
+        if self._client_cache is None or self._client_cache[0] != key:
+            self._client_cache = (key, OpenAI(
+                api_key=key or "",
+                base_url=os.getenv("DASHSCOPE_BASE_URL"),
+            ))
+        return self._client_cache[1]
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         """为文档列表生成向量;按 ≤2 条分批,保持与输入同序。
@@ -64,20 +85,20 @@ class EmbeddingModelService(BaseModelService):
         vectors: List[List[float]] = []
         for i in range(0, len(texts), 2):
             batch = texts[i:i + 2]
-            response = self.client.embeddings.create(
-                model=self.model,
+            response = self._client().embeddings.create(
+                model=self._model,
                 input=batch,
-                dimensions=self.dimensions,
+                dimensions=self._dimensions,
             )
             vectors.extend(item.embedding for item in response.data)
         return vectors
 
     def embed_query(self, text: str) -> List[float]:
         """为查询文本生成向量"""
-        response = self.client.embeddings.create(
-            model=self.model,
+        response = self._client().embeddings.create(
+            model=self._model,
             input=text,
-            dimensions=self.dimensions,
+            dimensions=self._dimensions,
         )
         return response.data[0].embedding
 
@@ -104,7 +125,7 @@ class RerankModelService(BaseModelService):
             "parameters": {"top_n": top_n, "return_documents": False},
         }).encode("utf-8")
         req = urllib.request.Request(self._RERANK_URL, data=body, headers={
-            "Authorization": f"Bearer {os.getenv('DASHSCOPE_API_KEY')}",
+            "Authorization": f"Bearer {dashscope_api_key()}",
             "Content-Type": "application/json",
         })
         with urllib.request.urlopen(req, timeout=30) as resp:
@@ -112,7 +133,15 @@ class RerankModelService(BaseModelService):
         results = data["output"]["results"]
         return [(r["index"], r["relevance_score"]) for r in results]
 
-chat_model = ChatModelService().get_model_service()
+# 模块级默认聊天模型改为「惰性获取」:不在 import 时构建(否则无 API key 时
+# 一 import 就抛 Missing credentials,服务器连启动都不行)。真正要建默认模型时
+# 才读当前 key;无 key 由调用方/门槛统一提示。
+def get_default_chat_model(temperature: float | None = None):
+    """按 model.yml 默认模型名构建聊天模型(读当前生效 key)。无 key 时抛错由上层处理。"""
+    name = (model_conf.get("model") or "").split(":", 1)[-1] or ""
+    return get_chat_model(name or "qwen3.8-flash", temperature=temperature)
+
+
 emb_model = EmbeddingModelService()
 rerank_model = RerankModelService()
 

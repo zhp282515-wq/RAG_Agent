@@ -5,15 +5,33 @@
 const App = {
   currentView: "chat",
 
+  /** 侧栏显示模式:会话(sessions) or 系统配置子栏(config) */
+  sidebarMode: "sessions",
+
   switchView(view) {
     this.currentView = view;
     document.querySelectorAll(".tab").forEach((t) =>
       t.classList.toggle("active", t.dataset.view === view));
     document.querySelectorAll(".view").forEach((v) =>
       v.classList.toggle("active", v.id === `view-${view}`));
+    // 系统配置页:侧栏切为配置子栏;其余页切回会话管理
+    if (view === "config") this.showConfigSidebar(true);
+    else if (this.sidebarMode === "config") this.showConfigSidebar(false);
     // 各页进入时刷新数据
     if (view === "docs") DocsUI.refresh();
     if (view === "chat") ChatUI.scrollBottom();
+    if (view === "debug") DebugUI.prefill();
+    if (view === "config") ConfigUI.refresh();
+  },
+
+  /* ---------- 侧栏内容切换:会话管理 <-> 系统配置子栏 ---------- */
+  showConfigSidebar(on) {
+    const s = document.getElementById("sidebar-sessions");
+    const c = document.getElementById("sidebar-config");
+    if (!s || !c) return;
+    this.sidebarMode = on ? "config" : "sessions";
+    s.classList.toggle("hidden", on);
+    c.classList.toggle("hidden", !on);
   },
 
   /* ---------- 深色模式 ---------- */
@@ -71,15 +89,8 @@ const App = {
     this.applyWallpaper();
   },
 
-  /* ---------- 设置:齿轮弹出菜单 → 外观设置二级弹窗 ---------- */
-  toggleSettingsMenu(e) {
-    if (e) e.stopPropagation();
-    const menu = document.getElementById("settings-menu");
-    menu.classList.toggle("hidden");
-  },
-  openAppearance(e) {
-    if (e) e.stopPropagation();
-    document.getElementById("settings-menu").classList.add("hidden");
+  /* ---------- 外观设置弹窗(由右上角头像菜单 → 外观设置 打开) ---------- */
+  openAppearance() {
     document.getElementById("settings-modal").classList.remove("hidden");
   },
   closeSettings() {
@@ -118,7 +129,7 @@ document.addEventListener("DOMContentLoaded", () => {
   // 会话栏折叠
   App.initSidebar();
 
-  // 设置弹窗:齿轮用内联 onclick 打开;这里只处理关闭与遮罩
+  // 外观设置弹窗:遮罩点击关闭
   document.getElementById("btn-settings-close").addEventListener("click", () => App.closeSettings());
   const settingsModal = document.getElementById("settings-modal");
   settingsModal.addEventListener("click", (e) => {
@@ -129,7 +140,7 @@ document.addEventListener("DOMContentLoaded", () => {
   blurSlider.addEventListener("input", () => App.setBlur(blurSlider.value));
   App.initBlur();
 
-  // 壁纸:默认渐变;头像菜单点击展开
+  // 壁纸:默认渐变;右上头像菜单点击展开;「外观设置」打开弹窗
   App.applyWallpaper();
   const avatar = document.getElementById("avatar-wrap");
   const menu = avatar.querySelector(".avatar-menu");
@@ -137,20 +148,25 @@ document.addEventListener("DOMContentLoaded", () => {
     e.stopPropagation();
     menu.classList.toggle("hidden");
   });
-  // 点击空白处关闭各下拉菜单(齿轮设置菜单/头像菜单);菜单内点击已 stopPropagation 不会触发
-  document.addEventListener("click", () => {
+  document.getElementById("btn-appearance").addEventListener("click", (e) => {
+    e.stopPropagation();
     menu.classList.add("hidden");
-    const sm = document.getElementById("settings-menu");
-    if (sm) sm.classList.add("hidden");
+    App.openAppearance();
   });
+  // 点击空白处关闭头像菜单
+  document.addEventListener("click", () => menu.classList.add("hidden"));
 
+  // 壁纸(现归属外观设置弹窗内):更换 / 恢复默认
   const wallpaperInput = document.createElement("input");
   wallpaperInput.type = "file";
   wallpaperInput.accept = "image/*";
   wallpaperInput.className = "wallpaper-input";
   document.body.appendChild(wallpaperInput);
-
   document.getElementById("btn-wallpaper").addEventListener("click", () => wallpaperInput.click());
+  document.getElementById("btn-wallpaper-reset").addEventListener("click", () => {
+    if (!confirm("恢复默认背景壁纸?")) return;
+    App.resetWallpaper();
+  });
   wallpaperInput.addEventListener("change", (e) => {
     const f = e.target.files[0];
     if (!f) return;

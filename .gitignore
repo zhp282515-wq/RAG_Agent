@@ -28,6 +28,8 @@ data/
 volumes/
 logs/
 attu
+简历项目描述.md
+面试问答备考清单.md
 
 # 模型权重等大文件(如未来加入)
 model/*.gguf

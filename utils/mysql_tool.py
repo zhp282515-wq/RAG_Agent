@@ -62,6 +62,30 @@ _BUSINESS_DDL = [
         KEY idx_reports_created (created_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
+    # 全局系统设置(k/v JSON;由 web「系统配置」页读写,服务端运行时常读最新值)
+    """
+    CREATE TABLE IF NOT EXISTS app_settings (
+        skey       VARCHAR(64)  NOT NULL,
+        value_json MEDIUMTEXT   NOT NULL,      -- 设置值 JSON(数字/字符串/小结构)
+        updated_at VARCHAR(32)  NOT NULL,
+        PRIMARY KEY (skey)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+    # 可插拔工具注册表:内置(7 默认)可启停 + 外部 MCP 工具注册挂载
+    """
+    CREATE TABLE IF NOT EXISTS tool_registry (
+        id          INT AUTO_INCREMENT PRIMARY KEY,
+        tool_key    VARCHAR(64)  NOT NULL,      -- 唯一标识(内置=tool 函数名;外部=注册 key)
+        kind        VARCHAR(16)  NOT NULL,      -- builtin | external
+        label       VARCHAR(100) NOT NULL,      -- 展示名(中文)
+        enabled     TINYINT(1)   NOT NULL DEFAULT 1,
+        transport   VARCHAR(16)  NOT NULL DEFAULT '',  -- stdio | http (external only)
+        config_json MEDIUMTEXT   NOT NULL,      -- external: {"command"/"url","args":[]} 等
+        created_at  VARCHAR(32)  NOT NULL,
+        updated_at  VARCHAR(32)  NOT NULL,
+        UNIQUE KEY uq_tool_key (tool_key)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
 ]
 
 
@@ -129,6 +153,13 @@ def init_db() -> None:
         _execute_statements(conn, _BUSINESS_DDL)
     finally:
         conn.close()
+
+    # 2.5) 全局系统设置默认值(app_settings 建表后种子化;已有行不覆盖)
+    try:
+        from utils.settings_store import ensure_defaults
+        ensure_defaults()
+    except Exception as e:
+        logger.warning(f"init_db: 初始化全局设置默认值失败(将回退内置默认):{e}")
 
     # 3) langgraph checkpointer 表
     # 直接逐条执行官方 MIGRATIONS(每条 DDL 幂等:表用 IF NOT EXISTS,索引/列已存在

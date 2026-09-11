@@ -23,6 +23,7 @@
 | 层 | 选型 |
 | --- | --- |
 | 智能体框架 | LangChain `create_agent` / LangGraph（含官方中间件扩展 + PyMySQLSaver checkpointer） |
+| 工具扩展 | 内置 7 工具可启停 + **MCP 标准**注册外部工具（`langchain-mcp-adapters`，stdio/http），统一 `@@TOOL_ERROR@@` 协议 |
 | 大模型 | DashScope：`qwen3.8-flash`(对话) / `qwen3.7-text-embedding-flash`(向量) / `qwen3.7-text-rerank`(精排) / `qwen-vl-plus`(VLM 图片描述) |
 | 向量数据库 | Milvus v2.4 + etcd + MinIO（Docker Compose 编排，HNSW + COSINE） |
 | 后端 | Python 3.13 / FastAPI + SSE 流式 / PyMySQL / PyMuPDF / python-docx / openpyxl |
@@ -117,8 +118,9 @@ VectorStoreService().load_document("D:/docs/扫地机器人100问.pdf")
 
 - **会话**：多轮流式问答；可上传图片 / 附件文档；右侧实时展示「工作流」阶段与回答「溯源来源」。
 - **知识库**：已入库文档列表（分片数 / 大小 / 格式），文档预览与分片预览，删除。
-- **检索调试**：输入检索词，直接对比向量检索与 Rerank 精排后的 Top-N 命中及相关度。
+- **检索调试**：输入检索词，直接对比向量检索与 Rerank 精排后的 Top-N 命中及相关度（top_k 可临时覆盖）。
 - **报告**：输入用户 ID 与月份生成使用报告（流式），报告自动保存、可二次编辑。
+- **系统配置**：切到该页时左侧栏变为配置子栏，可调 **检索参数**（top_k / rerank_n / 高低相关阈值，存 MySQL 全局、下次提问生效）、**对话模型**（默认模型 / 温度）、**工具**（7 个内置工具可独立启停；外部 MCP 工具按 stdio / http 注册挂载，注册前自动连通探测；外部工具异常统一按 `@@TOOL_ERROR@@` 协议返回）。
 
 ## 六、目录结构
 

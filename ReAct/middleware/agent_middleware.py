@@ -10,6 +10,7 @@ from langchain.agents import AgentState
 from langgraph.runtime import Runtime
 from utils.prompts_tool import get_prompt
 from utils.path_tool import get_abs_path
+from ReAct.tools.retry_util import tool_error_block
 
 
 # ---------------- web 事件收集 ----------------
@@ -214,7 +215,20 @@ def monitor_tool(
 
     except Exception as e:
         logger.error(f"【中间件执行】[monitor_tool] 工具{tool_name}执行异常:{str(e)}")
-        raise e
+        # 工具栈内 with_retry 会把瞬时错误消化为返回,泄漏到这里的多为未归类意外异常;
+        # 补发 phase_end(status=失败)闭合工作流阶段,并转成 ToolMessage 让模型正常应答,
+        # 避免整轮中止或前端留下悬挂阶段
+        trace_emit(request.runtime, parent_phase, "phase_end", tool_name,
+                   _time.perf_counter() - t0,
+                   {"status": "失败", "error": _content_preview(str(e), 80)},
+                   ph_id=ph_id)
+        return ToolMessage(
+            content=tool_error_block(
+                etype="工具执行异常", reason=str(e),
+                suggestion="请如实告知用户该步骤失败,不要编造结果",
+            ),
+            tool_call_id=request.tool_call["id"],
+        )
 
 
 def _content_preview(content, limit: int | None = None) -> str:

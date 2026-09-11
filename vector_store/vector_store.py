@@ -19,6 +19,14 @@ import time
 from rich import print as rprint
 
 
+class VectorSearchError(RuntimeError):
+    """检索基础设施故障(向量化/Milvus 连接或查询失败)。
+
+    默认 search() 将其降级为返回 [];agent 工具路径开启 raise_on_infra_error 后,
+    此异常上抛给调用方,以区别于「真无相关文档」。
+    """
+
+
 # 文件扩展名 -> file_tool 解析函数 的映射
 _PARSER_BY_EXT = {
     "txt": get_txt_document,
@@ -391,19 +399,32 @@ class VectorStoreService:
         return True
 
     def search(self, query: str, top_k: int = 20, score_threshold: float = 0.0,
-               file_names: list[str] | None = None) -> list[dict]:
+               file_names: list[str] | None = None,
+               raise_on_infra_error: bool = False) -> list[dict]:
         """向量检索:query 向量化 -> Milvus COSINE 相似度召回 top_k 个分片。
 
         Returns:
             [{pk, text, score, file_name, file_type}], 按 score 降序。
             score 为 COSINE 相似度(0~1)。file_names 非空时限定在这些文档内检索。
+
+        Raises:
+            VectorSearchError: 仅当 raise_on_infra_error=True 且向量化/Milvus 故障时抛出,
+                便于上层区分「基础设施故障」与「无相关文档」;默认 False 保持降级返回 []。
         """
-        client = self._get_client()
+        try:
+            client = self._get_client()
+        except Exception as e:
+            logger.error(f"search: 连接 Milvus 失败: {e}")
+            if raise_on_infra_error:
+                raise VectorSearchError(f"连接 Milvus 失败:{e}") from e
+            raise  # 默认保持历史行为:原样上抛
         logger.debug(f"search: query={query[:50]!r} top_k={top_k} file_names={file_names}")
         try:
             qvec = emb_model.embed_query(query)
         except Exception as e:
             logger.error(f"search: 查询向量化失败: {e}")
+            if raise_on_infra_error:
+                raise VectorSearchError(f"查询向量化失败:{e}") from e
             return []
         req = dict(
             collection_name=_COLLECTION_NAME,
@@ -423,6 +444,8 @@ class VectorStoreService:
             res = client.search(**req)[0]
         except Exception as e:
             logger.error(f"search: Milvus 检索失败: {e}")
+            if raise_on_infra_error:
+                raise VectorSearchError(f"Milvus 检索失败:{e}") from e
             return []
         hits = [
             {
@@ -441,22 +464,25 @@ class VectorStoreService:
         logger.debug(f"search: 命中 {len(hits)} 条(top1 score={hits[0]['score']:.3f})" if hits else "search: 未命中任何分片")
         return hits
 
-    def get_base_retriever(self, top_k: int | None = None):
+    def get_base_retriever(self, top_k: int | None = None, raise_on_infra_error: bool = False):
         """返回纯向量检索器:top_k 默认取 vector_store.yml 配置,调用时只传 query。
 
         独立成方法便于评估时与 get_rerank_retriever 对照(是否加精排的增益)。
+        raise_on_infra_error: True 时基础设施故障上抛 VectorSearchError,否则降级返回 []。
         """
         top_k = top_k or vector_store_conf.get("top_k", 20)
         def retrieve(query: str, file_names: list[str] | None = None) -> list[dict]:
-            return self.search(query, top_k=top_k, file_names=file_names)
+            return self.search(query, top_k=top_k, file_names=file_names,
+                               raise_on_infra_error=raise_on_infra_error)
         return retrieve
 
     def get_rerank_retriever(self, top_k: int | None = None, rerank_n: int | None = None,
-                             on_step=None):
+                             on_step=None, raise_on_infra_error: bool = False):
         """返回 向量粗排 + rerank 精排 的检索器:top_k/rerank_n 默认取 vector_store.yml 配置,调用时只传 query。
 
         on_step: 可选回调 `(label: str, info: dict)` 在检索内部子步骤(向量召回/精排/过滤)发生时调用,
                 供上层把工作流细化到每一步(web 工作流面板展示)。
+        raise_on_infra_error: True 时向量化/Milvus 故障上抛 VectorSearchError,否则降级返回 []。
         """
         top_k = top_k or vector_store_conf.get("top_k", 20)
         rerank_n = rerank_n or vector_store_conf.get("rerank_n", 5)
@@ -466,7 +492,8 @@ class VectorStoreService:
             # ① 向量召回
             if on_step:
                 on_step("向量召回", {"阶段": f"召回 {top_k} 个候选分片"})
-            hits = self.search(query, top_k=top_k, file_names=file_names)
+            hits = self.search(query, top_k=top_k, file_names=file_names,
+                               raise_on_infra_error=raise_on_infra_error)
             if not hits:
                 logger.warning(f"get_rerank_retriever: 向量检索无命中,query={query[:50]!r}")
                 if on_step:
@@ -506,4 +533,4 @@ if __name__ == '__main__':
     #
     res = svc.get_rerank_retriever()("不同季节机器人保养方案")
     for r in res:
-        print(r)
+        rprint(r)

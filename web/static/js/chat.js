@@ -210,26 +210,72 @@ const ChatUI = {
       return nodes[nodes.length - 1];
     };
 
-    const cursor = document.createElement("span");
-    cursor.className = "cursor-blink";
-    const showCursor = () => { const b = bubbleEl(); if (b && !b.querySelector(".cursor-blink")) b.appendChild(cursor); };
-    const hideCursor = () => { cursor.remove(); };
-    showCursor();
+    // 动态指示徽标:放在回答卡片内(气泡之后),markdown 重绘不触碰它 → spinner 平滑转动
+    LiveStatus.start();
+    const syncBadge = () => { LiveStatus.attach(LiveStatus.currentCard()); };
 
     let doneFired = false;
     const modelName = ModelPicker.current();
-    // markdown 流式渲染节流(避免每 token 重解析)
-    let mdTimer = null;
-    const flushMd = () => {
-      mdTimer = null;
+    // —— 流式 + 实时 markdown 排版 ——
+    // 输出过程中每隔一小段(基础 60ms)就把当前内容局部 markdown 渲染到气泡内,
+    // 让标题/加粗/表格边出边成型;间隔按渲染耗时自适应:渲染快→跟手,渲染慢→降频防卡。
+    // 超长内容(>30k 字符)自动退化为纯文本追加,收尾一次性排版,避免持续重解析卡顿。
+    const MAX_LIVE_MD = 30000;
+    let baseMs = 60;             // 基础渲染间隔
+    let liveMd = false;          // 当前是否处于"实时 markdown"模式
+    let tickTimer = null;
+    let lastShownLen = 0;        // 上次已渲染进气泡的长度
+
+    const isLong = () => asst.content.length > MAX_LIVE_MD;
+
+    const renderMdLive = () => {
       const b = bubbleEl();
-      if (b) { b.innerHTML = this.mdToHtml(asst.content); b.appendChild(cursor); }
+      if (!b) return;
+      const t0 = performance.now();
+      b.innerHTML = this.mdToHtml(asst.content);
+      const cost = performance.now() - t0;
+      // 自适应:单次渲染越久,间隔越拉大;渲染很轻则贴近 60ms 保持跟手
+      baseMs = cost > 25 ? Math.min(320, baseMs + 40) : Math.max(60, baseMs - 10);
+      lastShownLen = asst.content.length;
       this.scrollBottom();
     };
-    const queueMd = () => {
-      if (mdTimer) return;
-      mdTimer = setTimeout(flushMd, 180);
+
+    const appendPlain = () => {
+      const b = bubbleEl();
+      if (!b) return;
+      const chunk = asst.content.slice(lastShownLen);
+      if (chunk) {
+        b.appendChild(document.createTextNode(chunk));
+        lastShownLen = asst.content.length;
+        this.scrollBottom();
+      }
     };
+
+    const tick = () => {
+      tickTimer = null;
+      if (!this.sending) return;
+      // 决定本帧走哪条渲染路径:短内容实时 markdown;超长走纯文本(防卡)
+      const wantLive = !isLong();
+      if (liveMd !== wantLive) {
+        liveMd = wantLive;
+        lastShownLen = 0;
+        const b = bubbleEl();
+        if (b) b.innerHTML = "";
+      }
+      if (liveMd) {
+        if (asst.content.length !== lastShownLen) renderMdLive();
+      } else {
+        appendPlain();
+      }
+      // 仍在输出则按自适应间隔续拍
+      if (this.sending) tickTimer = setTimeout(tick, baseMs);
+    };
+
+    // token 到达:先即时把文本也喂给 content 累积,再由 tick 定时排版
+    const kick = () => {
+      if (tickTimer === null) tickTimer = setTimeout(tick, 24);
+    };
+
     this.currentHandle = sseRequest({
       url: "/api/chat",
       body: {
@@ -241,17 +287,19 @@ const ChatUI = {
       },
       onToken: (t) => {
         asst.content += t;
-        queueMd();
+        LiveStatus.onOutput();  // 模型开始吐字 → "解答中"
+        kick();
       },
       onTrace: (tr) => {
         WorkflowPanel.addStep(tr);
         asst.workflow.push(tr);
+        LiveStatus.onEvent(tr);
       },
       onSources: (srcs) => {
         asst.sources = srcs || [];
         this.draw();  // 重绘整屏:每答从各自的 m.sources 渲染,溯源记录可用
-        const b = bubbleEl();
-        if (b) b.appendChild(cursor);
+        lastShownLen = 0;
+        syncBadge();  // draw 重建卡片,把徽标挂回当前回答卡片内
       },
       onDone: () => { doneFired = true; },
       onError: (msg) => {
@@ -262,8 +310,11 @@ const ChatUI = {
     });
 
     await this.currentHandle.promise;
-    hideCursor();
-    if (mdTimer) { clearTimeout(mdTimer); mdTimer = null; }
+    LiveStatus.stop();  // 生成结束,移除动态徽标
+    if (tickTimer !== null) { clearTimeout(tickTimer); tickTimer = null; }
+    // 收尾:确保最终内容以完整 markdown 呈现
+    const b = bubbleEl();
+    if (b) b.innerHTML = this.mdToHtml(asst.content);
     this.sending = false;
     this.setInputEnabled(true);
     WorkflowPanel.finish();
@@ -692,7 +743,99 @@ const SourcesModal = {
   },
 };
 
-/* ---------- 模型选择(自定义毛玻璃下拉) ---------- */
+/* ---------- 生成中动态指示(内联于回答文本末尾,替代闪烁光标) ---------- */
+const LiveStatus = {
+  _timer: null,
+  _start: 0,
+  _curLabel: "",
+  _el: null,
+  _phaseStartedAt: 0,
+
+  /** 生成开始:创建内联徽标(spinner/文字/计时各建一次,避免每次重建让 spinner 卡顿) */
+  start() {
+    this.stop();
+    this._start = performance.now();
+    this._phaseStartedAt = this._start;
+    this._curLabel = "准备中…";
+    this._el = document.createElement("span");
+    this._el.className = "ls-badge";
+    const sp = document.createElement("span");
+    sp.className = "ls-spinner";
+    this._labelEl = document.createElement("span");
+    this._labelEl.className = "ls-text";
+    this._timeEl = document.createElement("span");
+    this._timeEl.className = "ls-time";
+    this._el.append(sp, this._labelEl, this._timeEl);
+    this._render();
+    this._timer = setInterval(() => this._render(), 100);
+    const card = this.currentCard();
+    if (card) this.attach(card);
+  },
+
+  /** 挂到卡片内、气泡之后(作为气泡兄弟节点,避开 innerHTML 重绘),徽标动画不被中断 */
+  attach(card) {
+    if (!this._el || !card) return;
+    if (this._el.parentNode !== card) card.appendChild(this._el);
+  },
+
+  /** 取当前正在生成那条 AI 回答的卡片节点 */
+  currentCard() {
+    const cards = document.querySelectorAll(".msg.assistant .msg-card");
+    return cards.length ? cards[cards.length - 1] : null;
+  },
+
+  /** 模型开始吐字 → 切"解答中"(输出阶段) */
+  onOutput() {
+    if (!this._el) return;
+    this._curLabel = "解答中";
+    this._render();
+  },
+
+  /** trace 事件到达:更新"当前在做什么"文案 */
+  onEvent(tr) {
+    if (!this._el) return;
+    const act = tr.action;
+    const step = tr.step || "";
+    if (act === "phase_start") {
+      this._phaseStartedAt = performance.now();
+      if (step === "模型") this._curLabel = "模型思考中";
+      else if (tr.name && tr.name !== step) this._curLabel = tr.name;
+      else this._curLabel = step;
+    } else if (act === "substep") {
+      this._curLabel = tr.name || this._curLabel;
+      this._phaseStartedAt = performance.now();
+    } else if (act === "phase_end") {
+      this._phaseStartedAt = performance.now();
+      this._curLabel = "处理中…";
+    }
+    this._render();
+  },
+
+  /** 流结束:移除徽标 */
+  stop() {
+    if (this._timer) { clearInterval(this._timer); this._timer = null; }
+    if (this._el) { this._el.remove(); this._el = null; }
+  },
+
+  /** 只更新文字与计时,不重建 spinner(避免动画被打断卡顿) */
+  _render() {
+    if (!this._el) return;
+    const totalSec = ((performance.now() - this._start) / 1000).toFixed(1);
+    if (this._labelEl) this._labelEl.textContent = this._curLabel;
+    if (this._timeEl) this._timeEl.textContent = `${totalSec}s`;
+  },
+
+  esc(s) {
+    return String(s ?? "").replace(/[&<>"']/g, (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  },
+};
+
+/* ---------- 当前对话模型只读徽标 ----------
+   模型切换的唯一入口收敛到「系统配置 → 对话模型」(会写 DB + localStorage)。
+   聊天输入框旁仅展示当前模型;点「切换」跳到系统配置页对话模型卡片。
+   ModelPicker.setModel() 由系统配置页在选定模型时调用,实时同步本徽标。
+ */
 const ModelPicker = {
   models: [],
   currentModel: null,
@@ -702,11 +845,38 @@ const ModelPicker = {
     return this.currentModel || "";
   },
 
+  /** 程序化切换当前模型(系统配置页选定「默认模型」时同步);更新徽标 + 持久化。 */
+  setModel(model, persist = true) {
+    const name = String(model || "").trim();
+    if (!name) return;
+    this.currentModel = name;
+    if (persist) localStorage.setItem("chat-model", name);
+    const label = document.getElementById("chat-model-label");
+    if (label) label.textContent = name;
+  },
+
+  /** 跳去系统配置页的「对话模型」卡片 */
+  gotoConfig() {
+    const go = async () => {
+      App.switchView("config");
+      // 顶层 const ConfigUI 不挂 window,用 typeof 判断即可
+      if (typeof ConfigUI !== "undefined" && ConfigUI.switchPanel) {
+        // 先确保配置数据加载完成,再切到对话模型面板(避免竞态)
+        try { await ConfigUI.loadSettings(); } catch (_) {}
+        await ConfigUI.switchPanel("model");
+      }
+      // 让对话模型卡片滚动到视图内
+      const card = document.querySelector('#config-panel-model .cfg-card');
+      if (card) card.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    };
+    // 切到 config 页可能需先确保 ConfigUI 已就绪;等一帧再切面板
+    setTimeout(go, 30);
+  },
+
   async init() {
-    const btn = document.getElementById("model-picker-btn");
-    const menu = document.getElementById("model-picker-menu");
-    const label = document.getElementById("model-picker-label");
-    if (!btn || !menu) return;
+    const label = document.getElementById("chat-model-label");
+    const badge = document.getElementById("chat-model-badge");
+    if (!label) return;
 
     try {
       const data = await API.get("/api/models");
@@ -715,59 +885,24 @@ const ModelPicker = {
       console.error("模型列表加载失败:", e);
       this.models = [];
     }
-    if (!this.models.length) {
-      label.textContent = "模型";
-      return;
-    }
-
-    // 选中:优先记忆的选择,否则默认模型
+    // 当前模型:优先系统配置保存的默认模型 / localStorage,否则默认(current)
+    let chosen = "";
+    try {
+      const s = await API.get("/api/settings");
+      chosen = s.model_default || "";
+    } catch (_) { /* ignore */ }
     const saved = localStorage.getItem("chat-model");
     const def = this.models.find((m) => m.current);
-    this.currentModel = (saved && this.models.some((m) => m.model === saved))
-      ? saved
-      : (def ? def.model : this.models[0].model);
-
-    const renderMenu = () => {
-      menu.innerHTML = this.models.map((m) =>
-        `<button type="button" class="model-picker-item${m.model === this.currentModel ? " active" : ""}" data-model="${m.model}">${m.label}</button>`
-      ).join("");
-    };
-
-    const syncLabel = () => {
-      const cur = this.models.find((m) => m.model === this.currentModel);
-      label.textContent = cur ? cur.label : this.currentModel;
-    };
-
-    const open = () => {
-      document.getElementById("model-picker").classList.add("open");
-      menu.classList.remove("hidden");
-      renderMenu();
-    };
-    const close = () => {
-      document.getElementById("model-picker").classList.remove("open");
-      menu.classList.add("hidden");
-    };
-
-    btn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      if (menu.classList.contains("hidden")) open();
-      else close();
-    });
-    menu.addEventListener("click", (e) => {
-      const item = e.target.closest(".model-picker-item");
-      if (!item) return;
-      this.currentModel = item.dataset.model;
-      localStorage.setItem("chat-model", this.currentModel);
-      syncLabel();
-      renderMenu();
-      close();
-    });
-    // 点外部关闭
-    document.addEventListener("click", (e) => {
-      if (!e.target.closest("#model-picker")) close();
-    });
-
-    syncLabel();
+    this.currentModel = chosen || saved ||
+      (def ? def.model : (this.models[0] ? this.models[0].model : ""));
+    if (this.currentModel) {
+      label.textContent = this.currentModel;
+      // 若默认模型与本地记忆不同,以系统配置为准(持久化同步)
+      if (chosen && chosen !== saved) localStorage.setItem("chat-model", chosen);
+    }
+    if (badge) {
+      badge.addEventListener("click", () => this.gotoConfig());
+    }
   },
 };
 

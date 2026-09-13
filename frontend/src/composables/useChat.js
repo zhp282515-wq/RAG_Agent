@@ -21,7 +21,21 @@ const MAX_LIVE_MD = 30000;
 
 /** 消息列表 [{role, content, sources, workflow, images, docs, usage, _req?, renderedHtml?}] */
 export const messages = ref([]);
-export const sending = ref(false);
+
+/**
+ * 正在生成回答的会话集合。
+ * 与"当前展示的会话"解耦:生成期间切走再切回,这一轮照常继续、内容不丢。
+ */
+export const inFlight = reactive(new Set());
+
+/** 当前展示的会话是否正在生成(决定发送按钮禁用等) */
+export const sending = computed(() => inFlight.has(currentId.value));
+
+/** 每个会话的消息数组:切走时存下、切回时恢复(含正在生成的那轮) */
+const messageCache = new Map();
+/** 正在生成的会话 → 它那轮的 assistant 消息对象(工作流面板按会话取用) */
+const liveAsst = new Map();
+
 export const pendingImages = ref([]); // [{name, path}]
 export const pendingDocs = ref([]);   // [{name, path}]
 
@@ -119,6 +133,15 @@ export function jumpToBottom() {
 
 /* ---------------- 渲染 ---------------- */
 
+/**
+ * 把当前会话的消息存进缓存。
+ * 必须在切换前调用 —— 否则正在生成的那轮(消息对象还在被 SSE 回调写入)会随
+ * `messages.value = []` 一起丢掉,切回来就看不到内容了。
+ */
+export function saveCurrentMessages() {
+  if (currentId.value) messageCache.set(currentId.value, messages.value);
+}
+
 /** 输入框聚焦并给出提示 */
 export function focusInput(hint) {
   if (!inputEl) return;
@@ -126,14 +149,29 @@ export function focusInput(hint) {
   if (hint) inputEl.placeholder = hint;
 }
 
-/** 切换会话时的加载态:清空并显示占位 */
+/**
+ * 切换会话时的加载态。
+ * 若目标会话正有生成中的回答,直接恢复缓存(含未完成的流式内容),
+ * 而不是清空 —— 否则用户切回来会以为回答丢了。
+ */
 export function showSessionLoading() {
-  messages.value = [];
+  if (inFlight.has(currentId.value) && messageCache.has(currentId.value)) {
+    messages.value = messageCache.get(currentId.value);
+  } else {
+    messages.value = [];
+  }
   stick.value = true;
+  showJumpBtn.value = false;
 }
 
 /** 用服务端历史重建消息列表(含把前一条 user 配对成 assistant 的 _req) */
 export function renderHistory(msgs) {
+  const sessId = currentId.value;
+
+  // 该会话正在生成 → 保留流式中的那轮,只把已落库的历史补在前面。
+  // (后端只保存完成的轮次,若不拼接,切回时正在生成的回答会消失)
+  const live = sessId ? liveAsst.get(sessId) : null;
+
   const out = [];
   let lastUserReq = null;
   let lastCtx = 0;
@@ -169,7 +207,30 @@ export function renderHistory(msgs) {
     if (m.role === "assistant" && m.usage && m.usage.context) lastCtx = m.usage.context;
     out.push(item);
   }
+
+  // 拼接「正在生成」的那轮:流式写了一半的 assistant 对象。
+  // 用 live 自己的对象(而非重建),这样 SSE 回调继续写入时界面会实时更新。
+  if (live) {
+    // user 消息要按需补:后端在生成前就把本轮 user 落库了,所以服务端历史末尾
+    // 通常已经含它;若再补一条就重复了。只在末尾确实不是它时才补。
+    const liveQuery = (live._req && live._req.query) || "";
+    const tail = out[out.length - 1];
+    const alreadyHasUser = tail && tail.role === "user" && tail.content === liveQuery;
+    if (!alreadyHasUser) {
+      out.push({
+        role: "user",
+        content: liveQuery,
+        sources: [],
+        images: ((live._req && live._req.images) || []).map((i) => i.path),
+        docs: ((live._req && live._req.docs) || []).map((d) => ({ name: d.name })),
+      });
+    }
+    out.push(live);
+    lastCtx = (live.usage && live.usage.context) || lastCtx;
+  }
+
   messages.value = out;
+  if (sessId) messageCache.set(sessId, out);
   seedContext(lastCtx); // 进度条以最近一条 assistant 的 context 为准
   stick.value = true;   // 打开会话默认看最新内容 → 重置为贴底跟随
   showJumpBtn.value = false;
@@ -238,7 +299,10 @@ export async function send(query, images = [], docs = []) {
     if (!currentId.value) return;
   }
 
-  sending.value = true;
+  // 这一轮归属的会话。此后所有回调都用它,不用全局 currentId ——
+  // 用户可能在生成期间切走,若依赖全局值,收尾时的缓存/侧栏刷新会打到别的会话上。
+  const sessId = currentId.value;
+  inFlight.add(sessId);
   // 用户主动发消息 → 重新贴底跟随(他显然想看这一轮的回答)
   stick.value = true;
 
@@ -272,6 +336,8 @@ export async function send(query, images = [], docs = []) {
   // 先 push 代理对象再改,后续回调都走代理 → 触发重渲染。
   // (直接改原始对象会绕过 Vue 响应式,DOM 不更新 —— 曾导致流式内容整块才出现)
   messages.value.push(asst);
+  // 登记为"该会话正在生成的那轮":切走再切回时靠它把流式内容接回来
+  liveAsst.set(sessId, asst);
   scrollBottom();
 
   // 发送即清空文本框与已选附件(不影响本轮已提交的 images/docs)
@@ -319,10 +385,17 @@ export async function send(query, images = [], docs = []) {
 
   const modelName = currentModel.value;
 
+  /** 本轮是否仍在进行(与"当前展示哪个会话"无关) */
+  let alive = true;
   let tickTimer = null;
   let liveMd = false;
   let baseMs = 60;
   let lastShownLen = 0;
+
+  /** 仅当本轮会话仍在前台时才自动滚动(切走了就别白滚) */
+  const scrollIfVisible = () => {
+    if (currentId.value === sessId) scrollBottom();
+  };
 
   const renderMdLive = () => {
     const follow = stick.value;
@@ -332,7 +405,7 @@ export async function send(query, images = [], docs = []) {
     // 自适应:单次渲染越久,间隔越拉大;渲染很轻则贴近 60ms 保持跟手
     baseMs = cost > 25 ? Math.min(320, baseMs + 40) : Math.max(60, baseMs - 10);
     lastShownLen = asst.content.length;
-    if (follow) scrollBottom();
+    if (follow) scrollIfVisible();
   };
 
   /** 超长内容:只追加新增的纯文本,不重解析 markdown */
@@ -342,12 +415,14 @@ export async function send(query, images = [], docs = []) {
     const follow = stick.value;
     asst.renderedHtml += escapeHtml(chunk);
     lastShownLen = asst.content.length;
-    if (follow) scrollBottom();
+    if (follow) scrollIfVisible();
   };
 
   const tick = () => {
     tickTimer = null;
-    if (!sending.value) return;
+    // 用本轮自己的 alive 标志,而不是全局 sending ——
+    // 生成期间用户切走时 sending 会变 false,若依赖它,这一轮就断在这了。
+    if (!alive) return;
     const wantLive = asst.content.length <= MAX_LIVE_MD;
     if (liveMd !== wantLive) {
       liveMd = wantLive;
@@ -359,7 +434,7 @@ export async function send(query, images = [], docs = []) {
     } else {
       appendPlain();
     }
-    if (sending.value) tickTimer = setTimeout(tick, baseMs);
+    if (alive) tickTimer = setTimeout(tick, baseMs);
   };
 
   /** token 到达:先累积文本,再由 tick 定时排版 */
@@ -383,7 +458,6 @@ export async function send(query, images = [], docs = []) {
     },
     onTrace: (tr) => {
       asst.workflow.push(tr);
-      addWorkflowStep();
       onLiveEvent(tr);
     },
     onCtx: (c) => {
@@ -407,6 +481,7 @@ export async function send(query, images = [], docs = []) {
   });
 
   await currentHandle.promise;
+  alive = false;
   if (tickTimer !== null) {
     clearTimeout(tickTimer);
     tickTimer = null;
@@ -414,10 +489,16 @@ export async function send(query, images = [], docs = []) {
   stopLive(); // 生成结束,移除动态徽标
   // 收尾:确保最终内容以完整 markdown 呈现
   asst.renderedHtml = mdToHtml(asst.content);
-  sending.value = false;
-  finishWorkflow();
-  scrollBottom();
+  inFlight.delete(sessId);
+  liveAsst.delete(sessId);
+  // 本轮已落库(stream_output 内部 append_message)→ 丢弃缓存,下次切回来走服务端全量历史
+  messageCache.delete(sessId);
   await refreshAfterChat(); // 会话标题已生成,刷新侧边栏
+  // 该会话仍在前台 → 补一次滚动(生成期间可能被切走,回来要看到最新)
+  if (currentId.value === sessId) {
+    stick.value = true;
+    scrollBottom();
+  }
 }
 
 function escapeHtml(s) {
@@ -425,24 +506,31 @@ function escapeHtml(s) {
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
-/* ---------------- 工作流/上下文(供聊天页与面板联动) ---------------- */
+/* ---------------- 工作流(供聊天页与面板联动) ----------------
+ * 面板显示的是"当前会话"的工作流:
+ *   - 该会话正在生成 → 读它那轮的实时事件流(切回来接着看)
+ *   - 已结束       → 读该会话最后一条 assistant 的 workflow/usage(历史回填也适用)
+ */
 
-/** 当前正在进行的回答(工作流面板读取它的事件流) */
-export const activeWorkflow = ref([]);
-export const activeUsage = ref(null);
+/** 当前会话正在生成的那轮 assistant 消息(没有则 null) */
+export function activeWorkflowEvents() {
+  const live = currentId.value ? liveAsst.get(currentId.value) : null;
+  if (live) return live.workflow || [];
+  const last = messages.value[messages.value.length - 1];
+  return last && last.role === "assistant" ? last.workflow || [] : [];
+}
 
+export function activeWorkflowUsage() {
+  const live = currentId.value ? liveAsst.get(currentId.value) : null;
+  if (live) return live.usage || null;
+  const last = messages.value[messages.value.length - 1];
+  return last && last.role === "assistant" ? last.usage || null : null;
+}
+
+/** 刚发消息时清空面板(显示"暂无执行记录"直到第一个 trace 到达) */
 function startWorkflow() {
-  activeWorkflow.value = [];
-  activeUsage.value = null;
-}
-function addWorkflowStep() {
-  const last = messages.value[messages.value.length - 1];
-  activeWorkflow.value = last?.workflow ? [...last.workflow] : [];
-}
-function finishWorkflow() {
-  const last = messages.value[messages.value.length - 1];
-  activeWorkflow.value = last?.workflow ? [...last.workflow] : [];
-  activeUsage.value = last?.usage || null;
+  const live = currentId.value ? liveAsst.get(currentId.value) : null;
+  if (live) { live.workflow = []; live.usage = null; }
 }
 
 /* ---------------- 上下文占用进度条 ---------------- */

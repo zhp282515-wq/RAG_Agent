@@ -2,7 +2,7 @@
 import { computed, onUnmounted, ref, watch } from "vue";
 import { buildStages, totalRow, fmtDur } from "../composables/useWorkflowStages";
 import WfStageRow from "./WfStageRow.vue";
-import { activeWorkflow, activeUsage } from "../composables/useChat";
+import { activeWorkflowEvents, activeWorkflowUsage } from "../composables/useChat";
 
 /** 面板收起/展开 */
 const collapsed = ref(false);
@@ -10,8 +10,9 @@ const collapsed = ref(false);
 const tickNow = ref(Date.now());
 let timer = null;
 
-const stages = computed(() => buildStages(activeWorkflow.value, tickNow.value));
-const total = computed(() => totalRow(activeWorkflow.value, activeUsage.value));
+// 依赖 messages / currentId:切会话或流式写入时会重新求值
+const stages = computed(() => buildStages(activeWorkflowEvents(), tickNow.value));
+const total = computed(() => totalRow(activeWorkflowEvents(), activeWorkflowUsage()));
 const hasRunning = computed(() => stages.value.some((s) => s.state === "running"));
 
 /** 有进行中阶段时才跑实时计时器(与原生版 WorkflowPanel._tick 一致) */

@@ -15,10 +15,28 @@ import {
   commitRename,
   cancelRename,
 } from "../composables/useSessions";
+import { saveCurrentMessages } from "../composables/useChat";
 
 const renameInput = ref(null);
 /** 防止 blur 与 Enter/Esc 双触发重复提交(原生版用 committed 标志) */
 let committed = false;
+
+/**
+ * 切换会话前先把当前消息存进缓存。
+ * 否则正在生成的那轮(消息对象还在被 SSE 回调写入)会随消息列表清空而丢失,
+ * 切回来就看不到内容了。
+ */
+function onSwitch(id) {
+  if (id === currentId.value) return;
+  saveCurrentMessages();
+  switchTo(id);
+}
+
+/** 新建会话同样要先把当前消息存下(可能正有生成中的回答) */
+function onNewSession() {
+  saveCurrentMessages();
+  create();
+}
 
 /**
  * 用函数 ref 而不是 ref="name":后者放在 v-for 里会被 Vue 收集成数组,
@@ -59,7 +77,7 @@ function finishRename(s, save) {
 
 <template>
   <div id="sidebar-sessions">
-    <button id="btn-new-session" class="btn-liquid" @click="create">
+    <button id="btn-new-session" class="btn-liquid" @click="onNewSession">
       <svg class="ic"><use href="#i-plus" /></svg> 新建会话
     </button>
     <div class="session-search">
@@ -75,7 +93,7 @@ function finishRename(s, save) {
             :key="s.session_id"
             class="session-item"
             :class="{ active: s.session_id === currentId }"
-            @click="switchTo(s.session_id)"
+            @click="onSwitch(s.session_id)"
           >
             <span class="session-icon"><svg class="ic ic-xs"><use href="#i-chat" /></svg></span>
             <div class="session-body">

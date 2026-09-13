@@ -5,14 +5,14 @@ import vue from "@vitejs/plugin-vue";
 // base 只在 build 时需要是 /static/ —— server.py 用 app.mount("/static", StaticFiles(...))
 // 挂载,产出的 index.html 里资源引用要带这个前缀才能被后端解析。
 // dev 下必须是 /,否则应用被服务在 /static/ 路径下,而预览/浏览器访问的是根路径。
-// emptyOutDir: false —— web/static/ 是后端挂载目录,里面可能还有构建之外的内容,
-// 不能让 vite 清空它。
+// emptyOutDir: web/static/ 已整份交给 vite(只含产物 index.html 与 assets/),
+// 让 vite 每次构建清空,否则旧 hash 文件会一直堆积。
 export default defineConfig(({ command }) => ({
   plugins: [vue()],
   base: command === "build" ? "/static/" : "/",
   build: {
     outDir: "../web/static",
-    emptyOutDir: false,
+    emptyOutDir: true,
   },
   server: {
     port: 3000,

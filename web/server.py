@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 # 项目根目录加入 sys.path(uvicorn 从任意 cwd 启动都能 import 项目模块)
@@ -229,8 +229,8 @@ async def _no_cache_static(request: Request, call_next):
 
 @app.get("/")
 def index():
-    # 服务端 302 到带版本参数的页面(比本地跳转页更可靠:浏览器直接发全新请求,绕开缓存)
-    return RedirectResponse("/static/index.html?v=37")
+    # 前端由 Vite 构建到 web/static/,资源名自带 hash,无需再手工 bump ?v= 破缓存
+    return RedirectResponse("/static/index.html")
 
 
 # ---------------- 工具函数 ----------------

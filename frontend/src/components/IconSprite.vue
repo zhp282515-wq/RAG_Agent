@@ -3,7 +3,7 @@
 // 内联为隐藏 svg sprite,各组件用 <use href="#i-name"> 引用 —— 与原生版用法一致。
 //
 // 只保留实际被引用的图标。已剔除零引用的 i-smile / i-clipboard / i-clock / i-chevron-left
-// (核对方式:在 web/static/js 与 index.html 里 grep 每个 #i-* 的引用数)。
+// (迁移时逐个核对过每个 #i-* 的引用点)。
 </script>
 
 <template>

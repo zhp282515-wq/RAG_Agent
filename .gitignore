@@ -12,10 +12,12 @@ build/
 dist/
 
 # ---- 前端(Vue 源码入库,依赖与构建产物不入库) ----
+# 前端整份构建产物都不入库:web/static/ 完全由 vite build 生成
+# (index.html 里引用的是带 hash 的资源名,与 assets/ 必须同进同出,否则会 404)。
+# 部署前须先 `cd frontend && npm run build`。
 frontend/node_modules/
 frontend/dist/
-# vite 构建产物(web/static/ 由 FastAPI 挂载,只忽略 vite 产出的 assets/ 与产物 index.html)
-web/static/assets/
+web/static/
 
 # ---- 本地工具配置(含本机绝对路径) ----
 .claude/

@@ -23,4 +23,13 @@ export default defineConfig(({ command }) => ({
       "/uploads": "http://127.0.0.1:8001",
     },
   },
+  // `vite preview`(serve 构建产物)同样需要代理,否则本地看生产版时接口会 404。
+  // 真实部署时前端由 FastAPI 从 /static/ 提供,天然同源,不经过这里。
+  preview: {
+    port: 3000,
+    proxy: {
+      "/api": "http://127.0.0.1:8001",
+      "/uploads": "http://127.0.0.1:8001",
+    },
+  },
 }));

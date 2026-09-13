@@ -18,11 +18,11 @@ from ReAct.tools.retry_util import (
 external_data = {}
 
 
-def tool_step(name: str, params: dict | None = None) -> None:
+def tool_step(name: str, params: dict | None = None, tokens: int | None = None) -> None:
     """工具内部上报细化子步骤(供 web 工作流面板;CLI 无 web 收集时为空操作)。"""
     try:
         from ReAct.middleware.agent_middleware import tool_step_emit
-        tool_step_emit(name, params)
+        tool_step_emit(name, params, tokens=tokens)
     except Exception:
         pass
 
@@ -64,6 +64,15 @@ def _top_k() -> int:
 
 def _rerank_n() -> int:
     return int(_setting("retrieval.rerank_n", _RERANK_N))
+
+
+def _current_store() -> str | None:
+    """当前向量库名(系统配置页可切);读失败回退 None 由服务层取 yml 默认。
+
+    None 而非空串:VectorStoreService 对空值会回退默认库,交给它统一处理。
+    """
+    v = str(_setting("rag.current_store", "") or "").strip()
+    return v or None
 
 # 月份归一化:接受 YYYY-MM / YYYY-M,并容忍完整日期尾缀 -dd(get_current_month 实返 %Y-%m-%d)
 _MONTH_RE = re.compile(r"^(\d{4})-(\d{1,2})(?:-\d{1,2})?$")
@@ -125,8 +134,8 @@ def get_rerank_retriever(query: str) -> str:
     try:
         logger.debug(f"【工具执行】[get_rerank_retriever] 检索词:{query}")
         # 注册子步骤回调:向量召回/精排/过滤 发生时经中间件上报细化事件
-        def _step(name, info=None):
-            tool_step(name, info)
+        def _step(name, info=None, tokens=None):
+            tool_step(name, info, tokens=tokens)
         # 每次检索现读全局设置(系统配置页可改)→「下次提问/下次检索即生效」
         score_high = _score_high()
         score_min = _score_min()
@@ -134,7 +143,8 @@ def get_rerank_retriever(query: str) -> str:
         rerank_n = _rerank_n()
         # raise_on_infra_error:基础设施故障(向量化/Milvus)上抛 VectorSearchError,
         # 由下方转为 ToolRetryableError 进入重试;真「无相关文档」仍正常返回 []
-        hits = VectorStoreService().get_rerank_retriever(
+        # 检索目标库由「系统配置」的当前向量库决定(现读,切换后下次检索即生效)
+        hits = VectorStoreService(collection_name=_current_store()).get_rerank_retriever(
             top_k=top_k, rerank_n=rerank_n,
             on_step=_step, raise_on_infra_error=True,
         )(query)

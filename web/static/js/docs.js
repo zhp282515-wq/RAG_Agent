@@ -1,20 +1,126 @@
 /* ============================================
-   docs.js — 知识库页(文档管理)
-   上传(loading) / 列表 / 预览 / 删除 / md5 去重提示
+   docs.js — 知识库页(向量库管理 + 文档管理)
+   左栏:向量库列表 / 新建 / 切换当前库 / 删除
+   右侧:当前库的文档 上传 / 列表 / 预览 / 删除 / md5 去重提示
    ============================================ */
 
 const DocsUI = {
   uploading: false,
   allDocs: [],               // 全量文档(搜索过滤前的原始列表)
   formatFilter: "all",       // 当前选中的格式过滤("all"=全部)
+  stores: [],                // 向量库列表
+  currentStore: "",          // 当前选中的库名(检索用它)
+
+  async refreshStores() {
+    try {
+      const d = await API.get("/api/stores");
+      this.stores = d.stores || [];
+      this.currentStore = d.current || "";
+      this.renderStores();
+    } catch (e) {
+      console.error("向量库列表加载失败:", e);
+    }
+  },
+
+  /** 左栏:向量库列表(点选切换 / 删除) */
+  renderStores() {
+    const box = document.getElementById("store-list");
+    if (!box) return;
+    if (!this.stores.length) {
+      box.innerHTML = `<p class="muted store-empty">暂无向量库</p>`;
+      return;
+    }
+    box.innerHTML = "";
+    for (const s of this.stores) {
+      const item = document.createElement("div");
+      const active = s.name === this.currentStore;
+      item.className = "store-item" + (active ? " active" : "");
+      const chunks = s.chunks >= 0 ? `${s.chunks} 分片` : "—";
+      item.innerHTML = `
+        <svg class="ic ic-sm"><use href="#i-list"/></svg>
+        <div class="store-body">
+          <div class="store-name">${this.esc(s.name)}</div>
+          <div class="store-meta">${chunks}${s.is_default ? " · 默认" : ""}</div>
+        </div>
+        <button class="store-ren" title="重命名该向量库">${ic("edit", "ic-xs")}</button>
+        <button class="store-del" title="删除该向量库">${ic("trash", "ic-xs")}</button>`;
+      item.addEventListener("click", (e) => {
+        if (e.target.closest(".store-del") || e.target.closest(".store-ren")) return;
+        this.setCurrent(s.name);
+      });
+      item.querySelector(".store-ren").addEventListener("click", () => this.renameStore(s.name));
+      item.querySelector(".store-del").addEventListener("click", () => this.removeStore(s.name));
+      box.appendChild(item);
+    }
+  },
+
+  async renameStore(oldName) {
+    const input = prompt(`重命名向量库「${oldName}」\n(只能含字母/数字/下划线)`, oldName);
+    if (input === null) return;                 // 取消
+    const newName = input.trim();
+    if (!newName || newName === oldName) return;
+    try {
+      await API.put(`/api/stores/${encodeURIComponent(oldName)}`, { name: newName });
+      await this.refreshStores();
+      await this.refresh();                     // 当前库改名后,文档区标题要跟着变
+    } catch (e) {
+      alert("重命名失败:" + e.message);
+    }
+  },
+
+  async setCurrent(name) {
+    if (name === this.currentStore) return;
+    try {
+      await API.put("/api/stores/current", { name });
+      this.currentStore = name;
+      this.renderStores();
+      this.updateTitle();
+      await this.refresh();       // 文档列表跟着切到该库
+    } catch (e) {
+      alert("切换向量库失败:" + e.message);
+    }
+  },
+
+  async createStore() {
+    const name = (prompt("新建向量库名称(只能含字母/数字/下划线):") || "").trim();
+    if (!name) return;
+    try {
+      const d = await API.post("/api/stores", { name });
+      await this.refreshStores();
+      // 新建后直接切过去,省得再点一次
+      if (d.created) await this.setCurrent(d.name);
+    } catch (e) {
+      alert("新建失败:" + e.message);
+    }
+  },
+
+  async removeStore(name) {
+    const s = this.stores.find((x) => x.name === name);
+    const n = s && s.chunks >= 0 ? s.chunks : "?";
+    if (!confirm(`确定删除向量库「${name}」?\n\n将连同库内全部 ${n} 个分片一并删除,不可恢复。`)) return;
+    try {
+      await API.del(`/api/stores/${encodeURIComponent(name)}`);
+      await this.refreshStores();
+      await this.refresh();
+    } catch (e) {
+      alert("删除失败:" + e.message);
+    }
+  },
+
+  updateTitle() {
+    const t = document.getElementById("docs-title");
+    if (t) t.textContent = this.currentStore ? `知识库 · ${this.currentStore}` : "知识库";
+  },
 
   async refresh() {
     try {
-      const data = await API.get("/api/documents");
+      const q = this.currentStore ? `?store=${encodeURIComponent(this.currentStore)}` : "";
+      const data = await API.get("/api/documents" + q);
       this.allDocs = data.documents || [];
       // 若当前选的格式已不存在,复位为全部
       const fmts = this.availableFormats();
       if (this.formatFilter !== "all" && !fmts.includes(this.formatFilter)) this.formatFilter = "all";
+      this.updateTitle();
       this.renderFilters();
       this.render();
     } catch (e) {
@@ -127,7 +233,8 @@ const DocsUI = {
     document.getElementById("doc-preview-modal").classList.remove("hidden");
     bodyEl.textContent = "加载中…";
     try {
-      const data = await API.get(`/api/documents/chunks/${encodeURIComponent(fileName)}`);
+      const q = this.currentStore ? `?store=${encodeURIComponent(this.currentStore)}` : "";
+      const data = await API.get(`/api/documents/chunks/${encodeURIComponent(fileName)}${q}`);
       const chunks = data.chunks || [];
       // 渲染成可读卡片:每片带序号/页码/章节 + 文本
       bodyEl.innerHTML = "";
@@ -164,7 +271,8 @@ const DocsUI = {
   async remove(fileName) {
     if (!confirm(`确定从知识库删除「${fileName}」?`)) return;
     try {
-      await API.del(`/api/documents/${encodeURIComponent(fileName)}`);
+      const q = this.currentStore ? `?store=${encodeURIComponent(this.currentStore)}` : "";
+      await API.del(`/api/documents/${encodeURIComponent(fileName)}${q}`);
       await this.refresh();
     } catch (e) {
       alert("删除失败:" + e.message);
@@ -173,16 +281,23 @@ const DocsUI = {
 
   async upload(file) {
     if (this.uploading) return;
+    const store = this.currentStore;
+    if (!store) {
+      document.getElementById("upload-status").textContent = "请先在左侧栏新建或选择一个向量库";
+      return;
+    }
     this.uploading = true;
     const status = document.getElementById("upload-status");
-    status.textContent = `正在上传并入库「${file.name}」…(含向量化,可能需要一些时间)`;
+    status.textContent = `正在上传并入库到「${store}」…(含向量化,可能需要一些时间)`;
     try {
-      const data = await API.upload("/api/documents", file);
+      const q = `?store=${encodeURIComponent(store)}`;
+      const data = await API.upload("/api/documents" + q, file);
       if (data.ok) {
         status.textContent = `${ic("check","ic-sm")} ${data.message || "已入库"}(${data.chunk_count ?? 0} 个分片)`;
       } else {
         status.innerHTML = `${ic("link","ic-sm")} ${data.message || "上传失败"}`;
       }
+      await this.refreshStores();   // 分片数变了,刷新左栏统计
       await this.refresh();
     } catch (e) {
       status.innerHTML = `${ic("x","ic-sm")} 上传失败:${this.esc(e.message)}`;
@@ -198,6 +313,7 @@ const DocsUI = {
 };
 
 document.addEventListener("DOMContentLoaded", () => {
+  document.getElementById("btn-new-store").addEventListener("click", () => DocsUI.createStore());
   document.getElementById("btn-upload").addEventListener("click", () =>
     document.getElementById("doc-file-input").click());
   document.getElementById("doc-file-input").addEventListener("change", (e) => {
@@ -221,5 +337,6 @@ document.addEventListener("DOMContentLoaded", () => {
     DocsUI.renderFilters();
     DocsUI.render();
   });
-  DocsUI.refresh();
+  // 先取向量库列表(确定当前库),再拉该库的文档
+  DocsUI.refreshStores().then(() => DocsUI.refresh());
 });

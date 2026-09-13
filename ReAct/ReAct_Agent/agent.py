@@ -88,8 +88,16 @@ class ReActAgentService:
         # 工具来自可插拔注册表(解析放 init_db 之后,表/seed 就绪再取启用集)
         self.tools = []
         self.tool_rev = 0
-        self.middleware = [
-            monitor_tool,
+        self.middleware = [monitor_tool]
+        # 上下文压缩中间件:必须排在 log_befor_model 之前。
+        # log_befor_model 会发「模型」phase_start 并记录耗时起点;若压缩排在它之后,
+        # 时间线会显示压缩前的消息数,且模型阶段时长会把阻塞的摘要调用算进去。
+        # 构造失败返回 None(只跳过压缩,不影响 agent 可用性)。
+        from ReAct.middleware.summarization_mw import build_summarization_middleware
+        _summarize_mw = build_summarization_middleware()
+        if _summarize_mw is not None:
+            self.middleware.append(_summarize_mw)
+        self.middleware += [
             log_befor_model,
             log_after_model,
             report_prompt_model,
@@ -202,6 +210,37 @@ class ReActAgentService:
     def _build_config(self, session_id: str) -> dict:
         return {"configurable": {"thread_id": session_id}}
 
+    def _turn_usage(self, trace_holder: dict) -> dict:
+        """汇总本轮 token 用量(供落库与前端回显)。
+
+        两个口径必须分清,不可相加:
+          - context:最后一次模型调用的 input_tokens,即当前上下文体积 → 进度条分母。
+            把多次调用的 input 相加会重复计算不断增长的上下文。
+          - total:计费总量 = 各次模型 total_tokens + embedding + rerank + 摘要调用。
+
+        工具消耗(embedding/rerank)由 monitor_tool 写进 holder["usage"],而非读
+        usage_total():后者是 threading.local,而本函数可能被另一个线程调用
+        (web 的 drain_ctx 在 asyncio 线程里跑,工具却在 producer 线程里执行)。
+        """
+        u = dict(trace_holder.get("usage", {}) or {})
+        model_total = int(u.get("model_total", 0) or 0)
+        emb = int(u.get("embedding", 0) or 0)
+        rerank = int(u.get("rerank", 0) or 0)
+        summary = int(u.get("summary", 0) or 0)
+        ctx = int(u.get("context", 0) or 0)
+        return {
+            "context": ctx,
+            "total": model_total + emb + rerank + summary,
+            "model": model_total,
+            "reason": int(u.get("model_reason", 0) or 0),
+            "in": int(u.get("model_in", 0) or 0),
+            "out": int(u.get("model_out", 0) or 0),
+            "embedding": emb,
+            "rerank": rerank,
+            "summary": summary,
+            "calls": int(u.get("calls", 0) or 0),
+        }
+
     def _ensure_session(self, session_id: str | None) -> str:
         """若缺省则自动新建会话窗口并复用;返回确定后的 session_id。"""
         info = self.create_or_get_session(session_id)
@@ -304,7 +343,12 @@ class ReActAgentService:
                     "type": "image_url",
                     "image_url": {"url": f"data:{mime};base64,{base64.b64encode(img_bytes).decode()}"},
                 })
-            user_msg = HumanMessage(content=content)
+            user_msg = HumanMessage(
+                content=content,
+                # 图片元信息随消息带上:摘要压缩时 base64 会被替换成占位,
+                # 文件名从这里取得,保证「用户传过哪张图」这一事实不丢。
+                additional_kwargs={"images": self._user_images_meta(image_sources)},
+            )
         else:
             user_msg = HumanMessage(query or "")
 
@@ -321,6 +365,12 @@ class ReActAgentService:
         if trace_holder is not None:
             from ReAct.middleware.agent_middleware import TRACE_KEY
             ctx[TRACE_KEY] = trace_holder
+        # 清空工具用量累加器:避免上一轮的 embedding/rerank 消耗串到本轮统计
+        try:
+            from ReAct.middleware.agent_middleware import usage_reset
+            usage_reset()
+        except Exception:
+            pass
 
         answer_parts: list[str] = []
         try:
@@ -350,6 +400,9 @@ class ReActAgentService:
                     asst_payload["workflow"] = events
                 if srcs:
                     asst_payload["sources"] = srcs
+                usage = self._turn_usage(trace_holder)
+                if usage:
+                    asst_payload["usage"] = usage
             append_message(sid, "assistant", asst_payload)
             logger.info(f"stream_output: session={sid} 回答生成完成,总耗时 {fmt_duration(time.perf_counter()-t0)}")
 

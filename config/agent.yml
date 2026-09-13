@@ -6,4 +6,13 @@ session:
   max_image_bytes: 10485760   # 单张图片大小上限 10MB
   upload_dir: data\uploads    # 本地上传图片默认落盘目录
 
+  # ---- 上下文压缩(摘要) ----
+  # 历史超过 trigger_tokens 时,把较早的消息交给摘要模型压成一条摘要,
+  # 只保留最近 keep_tokens 的原文。压缩只作用于模型工作记忆(checkpointer),
+  # 不影响 agent_session_messages 业务表里用户可见的完整历史。
+  summarize_enabled: true
+  trigger_tokens: 200000      # 触发阈值(真实 input_tokens 口径;qwen3.8-flash 窗口 1M)
+  keep_tokens: 40000          # 压缩后原样保留的近期消息量(按 token 而非条数)
+  trim_tokens_to_summarize: 60000  # 送摘要模型前待摘内容的 token 上限(默认 4000 过小会静默丢历史)
+
 user_data_path: data\external\records.csv

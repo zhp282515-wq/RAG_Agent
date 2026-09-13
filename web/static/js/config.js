@@ -42,6 +42,10 @@ const ConfigUI = {
   async loadSettings() {
     try {
       this.settings = await API.get("/api/settings");
+      // 同步上下文进度条分母(与后端摘要触发阈值同源)
+      if (typeof ContextMeter !== "undefined" && this.settings && this.settings.context_limit) {
+        ContextMeter.setLimit(this.settings.context_limit);
+      }
     } catch (e) {
       console.error("系统配置加载失败:", e);
       this.settings = null;

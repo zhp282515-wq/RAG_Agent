@@ -17,7 +17,7 @@ import os
 from datetime import datetime
 
 from utils.mysql_tool import get_connection
-from utils.config_tool import model_conf
+from utils.config_tool import model_conf, vector_store_conf
 from utils.logger_tool import logger
 
 # ---------------- 默认值(与 config/*.yml 及 agent_tools 实测校准一致) ----------------
@@ -33,8 +33,12 @@ MODEL_DEFAULTS: dict[str, object] = {
     "model.default": model_conf.get("model", "").split(":", 1)[-1] or "",
     "model.temperature": 0.7,
 }
+# 知识库:agent 检索时查询的「当前向量库」(回退 vector_store.yml 的 collection_name)
+RAG_DEFAULTS: dict[str, object] = {
+    "rag.current_store": vector_store_conf.get("collection_name", "document_chunks"),
+}
 
-_DEFAULTS = {**RETRIEVAL_DEFAULTS, **MODEL_DEFAULTS}
+_DEFAULTS = {**RETRIEVAL_DEFAULTS, **MODEL_DEFAULTS, **RAG_DEFAULTS}
 
 TS_FMT = "%Y-%m-%d %H:%M:%S"
 

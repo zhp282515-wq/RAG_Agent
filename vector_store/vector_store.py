@@ -15,6 +15,7 @@ from utils.file_tool import (
 from model.modelfactory import emb_model, rerank_model
 import hashlib
 import os
+import re
 import time
 from rich import print as rprint
 
@@ -51,7 +52,7 @@ _FILE_NAME_FIELD = "file_name"
 _FILE_TYPE_FIELD = "file_type"
 _FILE_SIZE_FIELD = "file_size"
 
-_COLLECTION_NAME = vector_store_conf.get("collection_name", "document_chunks")
+_DEFAULT_COLLECTION = vector_store_conf.get("collection_name", "document_chunks")
 _VEC_DIM = vector_store_conf.get("dim", 1024)
 _MILVUS_URI = vector_store_conf.get("milvus_uri", "http://127.0.0.1:19530")
 
@@ -77,9 +78,39 @@ def _milvus_str(value: str) -> str:
     return "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
 
 
+def _take_usage(kind: str) -> int:
+    """取走自上次调用以来某类工具(embedding/rerank)的 token 消耗,供分步归因。
+
+    检索各阶段是顺序执行的,故「自上次取走以来的增量」正好等于本阶段消耗。
+    非工具场景(入库、调试检索)累加器未激活,恒为 0。
+    """
+    try:
+        from ReAct.middleware.agent_middleware import usage_take_since
+        return usage_take_since(kind)
+    except Exception:
+        return 0
+
+
+def _validate_store_name(name: str) -> str:
+    """校验并规整向量库名(Milvus collection 命名约束)。
+
+    只允许字母/数字/下划线且不以数字开头;非法即抛 ValueError(调用方转 400)。
+    """
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("向量库名称不能为空")
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
+        raise ValueError("名称只能用字母/数字/下划线,且不能以数字开头")
+    return name
+
+
 class VectorStoreService:
 
-    def __init__(self, chunk_size: int = vector_store_conf["chunk_size"], chunk_overlap: int = vector_store_conf["chunk_overlap"], separators: list = vector_store_conf["separators"]):
+    def __init__(self, chunk_size: int = vector_store_conf["chunk_size"],
+                 chunk_overlap: int = vector_store_conf["chunk_overlap"],
+                 separators: list = vector_store_conf["separators"],
+                 collection_name: str | None = None):
+        self.collection_name = (collection_name or "").strip() or _DEFAULT_COLLECTION
         self.splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
@@ -87,7 +118,8 @@ class VectorStoreService:
             length_function=len,
         )
         self._client: MilvusClient | None = None
-        logger.debug(f"VectorStoreService: 初始化完成 chunk_size={chunk_size} chunk_overlap={chunk_overlap}")
+        logger.debug(f"VectorStoreService: 初始化完成 collection={self.collection_name} "
+                     f"chunk_size={chunk_size} chunk_overlap={chunk_overlap}")
 
     # ---------- Milvus 连接与建库基建 ----------
 
@@ -103,13 +135,13 @@ class VectorStoreService:
         """若 collection 不存在则建表 + 建向量索引,并 load;已存在则直接 load。"""
         if self._client is None:
             return
-        if self._client.has_collection(_COLLECTION_NAME):
-            state = self._client.get_load_state(_COLLECTION_NAME)
+        if self._client.has_collection(self.collection_name):
+            state = self._client.get_load_state(self.collection_name)
             if state and state.get("state") != "Loaded":
-                logger.info(f"_ensure_collection: collection {_COLLECTION_NAME} 未加载,正在 load")
-                self._client.load_collection(_COLLECTION_NAME)
+                logger.info(f"_ensure_collection: collection {self.collection_name} 未加载,正在 load")
+                self._client.load_collection(self.collection_name)
             else:
-                logger.debug(f"_ensure_collection: collection {_COLLECTION_NAME} 已就绪")
+                logger.debug(f"_ensure_collection: collection {self.collection_name} 已就绪")
             return
 
         schema = self._client.create_schema(auto_id=True, enable_dynamic_field=True)
@@ -129,17 +161,17 @@ class VectorStoreService:
         index_params.add_index(field_name=_FILE_PATH_FIELD, index_type="INVERTED")
 
         self._client.create_collection(
-            collection_name=_COLLECTION_NAME,
+            collection_name=self.collection_name,
             schema=schema,
             index_params=index_params,
         )
-        self._client.load_collection(_COLLECTION_NAME)
-        logger.info(f"_ensure_collection: 已创建并加载 collection {_COLLECTION_NAME} (dim={_VEC_DIM})")
+        self._client.load_collection(self.collection_name)
+        logger.info(f"_ensure_collection: 已创建并加载 collection {self.collection_name} (dim={_VEC_DIM})")
 
     def _query_file_md5s(self, file_path: str) -> set[str]:
         """从 collection 查 file_path 对应块的 file_md5 值集合(去重后)。"""
         rows = self._client.query(
-            collection_name=_COLLECTION_NAME,
+            collection_name=self.collection_name,
             filter=f"{_FILE_PATH_FIELD} == {_milvus_str(file_path)}",
             output_fields=[_FILE_MD5_FIELD],
         )
@@ -166,7 +198,7 @@ class VectorStoreService:
 
     def _collection_has_md5(self, md5: str) -> bool:
         count = self._client.query(
-            collection_name=_COLLECTION_NAME,
+            collection_name=self.collection_name,
             filter=f"{_FILE_MD5_FIELD} == \"{md5}\"",
             output_fields=["count(*)"],
         )
@@ -197,12 +229,12 @@ class VectorStoreService:
             logger.error("del_md5_hex: Milvus 客户端未初始化,无法删除")
             return False
         res = self._client.delete(
-            collection_name=_COLLECTION_NAME,
+            collection_name=self.collection_name,
             filter=f"{_FILE_MD5_FIELD} == \"{md5_hex}\"",
         )
         deleted = res.get("delete_count", 0)
         if deleted:
-            self._client.flush(_COLLECTION_NAME)
+            self._client.flush(self.collection_name)
             logger.info(f"del_md5_hex: 已删除 md5={md5_hex} 的 {deleted} 个向量块及其 md5 记录")
         else:
             logger.debug(f"del_md5_hex: md5={md5_hex} 在向量库中无块,无需删除")
@@ -295,8 +327,8 @@ class VectorStoreService:
             rows.append(row)
 
         try:
-            self._client.insert(_COLLECTION_NAME, rows)
-            self._client.flush(_COLLECTION_NAME)
+            self._client.insert(self.collection_name, rows)
+            self._client.flush(self.collection_name)
         except Exception as e:
             logger.error(f"load_document: 写入向量库失败: {fname}: {e}")
             return False
@@ -333,7 +365,7 @@ class VectorStoreService:
         """
         client = self._get_client()
         rows = client.query(
-            collection_name=_COLLECTION_NAME,
+            collection_name=self.collection_name,
             filter="pk >= 0",
             output_fields=[
                 _FILE_PATH_FIELD, _FILE_MD5_FIELD, _FILE_NAME_FIELD,
@@ -359,7 +391,7 @@ class VectorStoreService:
         """列出某文档在向量库中的全部分片(按 pk 排序),供前端分片预览。"""
         client = self._get_client()
         rows = client.query(
-            collection_name=_COLLECTION_NAME,
+            collection_name=self.collection_name,
             filter=f"{_FILE_NAME_FIELD} == {_milvus_str(file_name)}",
             output_fields=["pk", _TEXT_FIELD, "page", "chapter", "section"],
             limit=2000,
@@ -385,7 +417,7 @@ class VectorStoreService:
         """
         client = self._get_client()
         rows = client.query(
-            collection_name=_COLLECTION_NAME,
+            collection_name=self.collection_name,
             filter=f"{_FILE_NAME_FIELD} == {_milvus_str(file_name)}",
             output_fields=[_FILE_MD5_FIELD],
         )
@@ -427,7 +459,7 @@ class VectorStoreService:
                 raise VectorSearchError(f"查询向量化失败:{e}") from e
             return []
         req = dict(
-            collection_name=_COLLECTION_NAME,
+            collection_name=self.collection_name,
             data=[qvec],
             anns_field=_VEC_FIELD,
             limit=top_k,
@@ -489,11 +521,14 @@ class VectorStoreService:
         def retrieve(query: str, file_names: list[str] | None = None) -> list[dict]:
             t0 = time.perf_counter()
             logger.debug(f"get_rerank_retriever: query={query[:50]!r} top_k={top_k} rerank_n={rerank_n}")
-            # ① 向量召回
+            # ① 向量召回(query 向量化的 token 消耗在调用后才可知,故先执行再读游标)
             if on_step:
                 on_step("向量召回", {"阶段": f"召回 {top_k} 个候选分片"})
             hits = self.search(query, top_k=top_k, file_names=file_names,
                                raise_on_infra_error=raise_on_infra_error)
+            emb_tok = _take_usage("embedding")
+            if on_step and emb_tok:
+                on_step("向量召回完成", {"候选数": len(hits)}, emb_tok)
             if not hits:
                 logger.warning(f"get_rerank_retriever: 向量检索无命中,query={query[:50]!r}")
                 if on_step:
@@ -507,6 +542,9 @@ class VectorStoreService:
             except Exception as e:
                 logger.error(f"get_rerank_retriever: 精排失败,退回向量检索结果: {e}")
                 return hits[:rerank_n]
+            rr_tok = _take_usage("rerank")
+            if on_step and rr_tok:
+                on_step("精排完成", {"候选数": len(hits)}, rr_tok)
             ordered = [hits[i] for i, _ in reranked]
             for h, (_, score) in zip(ordered, reranked):
                 h["score"] = score   # 用精排相关度分数替换向量相似度
@@ -514,6 +552,84 @@ class VectorStoreService:
             logger.debug(f"get_rerank_retriever: 精排完成,返回 {len(ordered)} 条,耗时 {fmt_duration(time.perf_counter()-t0)}")
             return ordered   # 列表顺序即精排名次
         return retrieve
+
+    # ---------- 多向量库(collection)管理 ----------
+
+    def list_stores(self) -> list[dict]:
+        """列出 Milvus 上全部向量库及其规模。
+
+        返回 [{name, chunks, is_default}],按名称排序。chunks 为分片数;
+        查询失败(库未加载等)时该库 chunks 记 -1,不影响其余库的列出。
+        """
+        try:
+            client = MilvusClient(uri=_MILVUS_URI)
+            names = list(client.list_collections() or [])
+        except Exception as e:
+            logger.error(f"list_stores: 连接 Milvus 失败: {e}")
+            return []
+        out: list[dict] = []
+        for n in sorted(names):
+            chunks = -1
+            try:
+                rows = client.query(collection_name=n, filter="pk >= 0",
+                                    output_fields=["count(*)"])
+                if rows:
+                    chunks = int(rows[0].get("count(*)") or 0)
+            except Exception as e:
+                logger.warning(f"list_stores: 统计 {n} 分片数失败: {e}")
+            out.append({"name": n, "chunks": chunks, "is_default": n == _DEFAULT_COLLECTION})
+        logger.info(f"list_stores: 共 {len(out)} 个向量库")
+        return out
+
+    def create_store(self, name: str) -> dict:
+        """新建向量库(建 collection + 向量索引并 load)。已存在则直接返回。
+
+        返回 {name, created: bool}。名称为空或含非法字符时抛 ValueError。
+        """
+        name = _validate_store_name(name)
+        client = MilvusClient(uri=_MILVUS_URI)
+        if client.has_collection(name):
+            logger.info(f"create_store: {name} 已存在,直接返回")
+            return {"name": name, "created": False}
+        # 借用一个指向该 collection 的实例复用建表逻辑
+        svc = VectorStoreService(collection_name=name)
+        svc._client = client
+        svc._ensure_collection()
+        logger.info(f"create_store: 已新建向量库 {name}")
+        return {"name": name, "created": True}
+
+    def rename_store(self, old_name: str, new_name: str) -> dict:
+        """重命名向量库(纯元数据改名,分片数据不动)。
+
+        Milvus 的 rename_collection 只改 collection 名,内部 segment/索引照旧,
+        所以不会丢数据。返回 {name: 新名, renamed: bool}。
+        源库不存在或新名已被占用时抛 ValueError。
+        """
+        old_name = (old_name or "").strip()
+        new_name = _validate_store_name(new_name)
+        if old_name == new_name:
+            return {"name": new_name, "renamed": False}
+        client = MilvusClient(uri=_MILVUS_URI)
+        if not client.has_collection(old_name):
+            raise ValueError(f"向量库不存在:{old_name}")
+        if client.has_collection(new_name):
+            raise ValueError(f"名称已被占用:{new_name}")
+        client.rename_collection(old_name, new_name)
+        logger.info(f"rename_store: 向量库 {old_name} 已改名为 {new_name}")
+        return {"name": new_name, "renamed": True}
+
+    def drop_store(self, name: str) -> bool:
+        """删除向量库(连同其中全部分片,不可恢复)。返回是否存在并被删除。"""
+        name = (name or "").strip()
+        if not name:
+            return False
+        client = MilvusClient(uri=_MILVUS_URI)
+        if not client.has_collection(name):
+            logger.warning(f"drop_store: 向量库 {name} 不存在")
+            return False
+        client.drop_collection(name)
+        logger.info(f"drop_store: 已删除向量库 {name}(含全部分片)")
+        return True
 
 
 if __name__ == '__main__':

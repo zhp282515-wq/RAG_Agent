@@ -59,15 +59,21 @@ JSON body:
 - `image_paths`:可空数组;非空时作为 image_sources 传入(多模态图片)。
 - `doc_paths`:可空数组;聊天中用户附带的文档,作为知识来源处理(agent 据此补充上下文)。若后端暂不区分,可将 doc_paths 与 query 一并提交或由后端决定如何利用;契约要求字段存在即可。
 
-**SSE 事件序列**(共五类,均 `data: {json}\n\n`):
+**SSE 事件序列**(共六类,均 `data: {json}\n\n`):
 
 | 事件 | 格式 | 说明 |
 |---|---|---|
-| trace | `{"trace": {"step": "调用工具", "name": "get_rerank_retriever", "duration": 0.52}}` | **工作流可视化**:agent 执行阶段推送;step 取值建议:查询改写 / 调用工具 / 工具完成 / 检索完成 / 模型生成 / 模型完成;duration 为该阶段秒数(可为 null) |
+| trace | `{"trace": {"step": "调用工具", "name": "get_rerank_retriever", "duration": 0.52, "tokens": 8074}}` | **工作流可视化**:agent 执行阶段推送;step 取值建议:查询改写 / 调用工具 / 工具完成 / 检索完成 / 模型生成 / 模型完成;duration 为该阶段秒数(可为 null);**tokens 为该步骤 token 消耗**(模型调用取 usage_metadata,检索取 embedding+rerank 用量;无计量时省略该字段) |
 | sources | `{"sources": [{"file_name": "x.pdf", "score": 0.93, "label": "高", "page": 3, "chapter": "…", "section": "…", "text": "截断至500字"}]}` | **该轮回答的溯源依据**(每次 get_rerank_retriever 执行后推送;无命中发 `{"sources": []}`);label:≥0.85 高 / ≥0.60 中 |
+| ctx | `{"ctx": {"used": 4617, "total": 15805, "reason": 74}}` | **会话上下文占用**(每次模型调用后推送,驱动前端进度条)。used=最后一次模型调用的 input_tokens(真实上下文体积),分母由 `/api/settings` 的 `context_limit` 给出;total=本轮计费总量(含 embedding/rerank/摘要),reason=其中的推理 token。发生上下文压缩时附 `compressed: {before, after}` |
 | token | `{"token": "文本片段"}` | 流式回答文本(可能多段) |
 | done | `{"done": true}` | 结束 |
 | error | `{"error": "..."}` | 出错后结束 |
+
+**上下文压缩(会话摘要)**:历史超过 `config/agent.yml` 的 `session.trigger_tokens` 时,
+较早的消息被摘要模型压成一条摘要,仅改变**模型工作记忆**(langgraph checkpointer);
+`agent_session_messages` 业务表始终保存完整的用户可见历史,前端回显不受影响。
+压缩发生时工作流会出现 `step="上下文压缩"` 的阶段事件(参数含 压缩前/压缩后/省下)。
 
 **后端实现提示**:
 - `stream_output` 是**同步生成器**(yield str),用 `StreamingResponse(gen)` 即可(FastAPI 线程池执行同步迭代器),每个 yield 的 str 包成 `data: {"token": ...}\n\n`。
@@ -99,23 +105,68 @@ SSE 事件与聊天相同(可含 trace/sources/token/done/error)。
 - top_k:请求体提供为**临时覆盖**(不写库、仅本次);缺省回退全局默认(系统配置,原 20)。
 - 后端:`VectorStoreService().get_rerank_retriever(top_k, rerank_n)` 后按全局达标线过滤并标注等级。
 
-## 6. 文档管理(知识库页)
+## 6. 向量库管理 + 文档管理(知识库页)
+
+支持多向量库(Milvus collection)。agent 检索查询「当前向量库」,在系统配置里切换;
+知识库页左栏可新建/切换/删除。
+
+### GET /api/stores
+```json
+{"stores": [{"name": "document_chunks", "chunks": 141, "is_default": true}], "current": "document_chunks"}
+```
+`chunks` 为分片数(统计失败时为 -1)。后端:`VectorStoreService.list_stores()`。
+
+### POST /api/stores
+body `{"name": "my_store"}`。名称仅允许字母/数字/下划线且不以数字开头。
+```json
+{"ok": true, "name": "my_store", "created": true}
+```
+已存在时 `created` 为 false(幂等);名称非法 400 `{"error": "..."}`。
+
+### DELETE /api/stores/{name}
+**连同库内全部分片一并删除,不可恢复。** 若删除的正是当前库,`rag.current_store` 自动回退默认库。
+```json
+{"ok": true, "name": "my_store"}
+```
+不存在:404。
+
+### PUT /api/stores/current
+body `{"name": "my_store"}`,切换 agent 检索用的当前库。
+```json
+{"ok": true, "current": "my_store"}
+```
+库不存在:404。
+
+### PUT /api/stores/{name}
+重命名向量库(纯元数据改名,**分片数据不动**)。body `{"name": "新名"}`。
+```json
+{"ok": true, "name": "新名", "renamed": true}
+```
+新旧同名时 `renamed` 为 false(空操作)。名称非法 / 源库不存在 / 新名被占用:400 `{"error": "..."}`。
+若改的正是当前检索库,`rag.current_store` 会同步更新为 `新名`。
+
+> 注意:`/api/stores/current` 必须声明在 `/api/stores/{name}` 之前 —— FastAPI 按注册顺序匹配,
+> 否则 `current` 会被当成库名路由到重命名处理器。
 
 ### POST /api/documents
-multipart/form-data,字段名 `file`。
-- 入库成功(200):`{"ok": true, "file_name": "x.pdf", "chunk_count": 16, "message": "已入库"}`
+multipart/form-data,字段名 `file`;可选 query 参数 `store`(缺省=当前库)。
+- 入库成功(200):`{"ok": true, "file_name": "x.pdf", "chunk_count": 16, "message": "已入库", "store": "…"}`
 - md5 重复(200):`{"ok": false, "message": "该文档已存在(md5 去重)"}`
 - 失败(400):`{"error": "..."}`
-后端:文件存 `data/uploads/` 后调 `VectorStoreService().load_document(path)`;入库为耗时操作(embedding),前端会显示 loading。
+后端:文件存 `data/uploads/` 后调 `VectorStoreService(collection_name=store).load_document(path)`;入库为耗时操作(embedding),前端会显示 loading。
 
 ### GET /api/documents
+可选 query 参数 `store`(缺省=当前库)。
 ```json
-{"documents": [{"file_name": "x.pdf", "file_type": "pdf", "file_size": "22.87 KB", "chunk_count": 16}]}
+{"documents": [{"file_name": "x.pdf", "file_type": "pdf", "file_size": 22870, "chunk_count": 16}], "store": "document_chunks"}
 ```
 后端:`list_documents()`。
 
+### GET /api/documents/preview/{file_name} · GET /api/documents/chunks/{file_name}
+均支持可选 query 参数 `store`。
+
 ### DELETE /api/documents/{file_name}
-file_name 需 URL 编码。
+file_name 需 URL 编码;支持可选 query 参数 `store`。
 ```json
 {"ok": true}
 ```

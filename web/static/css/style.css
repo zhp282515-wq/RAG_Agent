@@ -816,6 +816,9 @@ body.dark .model-picker-item:hover { background: rgba(60, 120, 255, 0.16); }
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .wf-step-dur { font-size: 11px; color: var(--accent); background: rgba(60, 120, 255, 0.13); border-radius: 999px; padding: 1px 8px; white-space: nowrap; flex-shrink: 0; }
+/* token 计量徽标:与耗时徽标同形但用中性色,避免两种量纲混淆 */
+.wf-step-tok { font-size: 11px; color: #5A6172; background: rgba(120, 130, 150, 0.14); border-radius: 999px; padding: 1px 8px; white-space: nowrap; flex-shrink: 0; }
+body.dark .wf-step-tok { color: #B9C0CE; background: rgba(150, 160, 180, 0.18); }
 /* 关键参数(检索词较长):允许折行,而非整行截断看不见 */
 .wf-step-params {
   font-size: 11.5px; color: var(--accent);
@@ -1321,3 +1324,94 @@ body.dark input.cfg-txt, body.dark input.slider-full.cfg-num { background: rgba(
 .cfg-apikey-actions { display: flex; gap: 10px; margin-top: 12px; }
 .cfg-apikey-actions .btn-ghost { display: inline-flex; align-items: center; gap: 6px; padding: 7px 14px; border-radius: 10px; }
 body.dark ::-webkit-scrollbar-thumb:hover { background: rgba(120, 150, 200, 0.5); background-clip: padding-box; }
+
+/* ---------- 会话上下文占用进度条(输入框上方) ---------- */
+#ctx-meter-wrap {
+  display: flex; align-items: center; gap: 8px;
+  padding: 0 4px 7px;
+}
+#ctx-meter-wrap.hidden { display: none; }
+.ctx-meter {
+  flex: 1; height: 4px; border-radius: 999px;
+  background: rgba(120, 130, 150, 0.18);
+  overflow: hidden;
+}
+body.dark .ctx-meter { background: rgba(150, 160, 180, 0.22); }
+.ctx-fill {
+  height: 100%; width: 0;
+  border-radius: 999px;
+  background: var(--accent);
+  /* 宽度过渡:压缩后从 100% 回落到实际值,让"被压缩了"看得见 */
+  transition: width .45s cubic-bezier(.4, 0, .2, 1), background-color .3s;
+}
+.ctx-fill.warn { background: #E8912D; }
+.ctx-fill.full { background: #D9534F; }
+.ctx-text {
+  font-size: 11px; color: #8A91A0;
+  white-space: nowrap; flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+body.dark .ctx-text { color: #9AA3B4; }
+
+/* ---------- 知识库页:向量库列表在左侧主导航栏,此处只放文档区 ---------- */
+.docs-main { display: flex; flex-direction: column; }
+
+#sidebar-stores { display: flex; flex-direction: column; }
+.store-head {
+  display: flex; align-items: center; justify-content: space-between;
+  font-size: 13px; font-weight: 600; color: var(--text-muted);
+  padding: 0 4px 8px; margin-bottom: 4px;
+  border-bottom: 1px solid var(--glass-border);
+}
+.store-head .icon-btn { width: 26px; height: 26px; }
+.store-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 8px; margin-top: 3px;
+  border-radius: 9px; cursor: pointer;
+  color: var(--text-muted); font-size: 13px;
+  transition: background var(--ease), color var(--ease);
+}
+.store-item:hover { background: rgba(255, 255, 255, 0.26); color: var(--text-main); }
+.store-item.active {
+  background: rgba(60, 120, 255, 0.14);
+  color: var(--accent); font-weight: 500;
+}
+.store-item .ic { flex-shrink: 0; }
+.store-body { flex: 1; min-width: 0; }
+.store-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.store-meta { font-size: 11px; color: var(--text-faint); margin-top: 1px; }
+.store-item.active .store-meta { color: var(--accent); opacity: .8; }
+.store-del, .store-ren {
+  border: none; background: transparent; color: var(--text-faint);
+  cursor: pointer; width: 20px; height: 20px; border-radius: 6px;
+  display: flex; align-items: center; justify-content: center;
+  opacity: 0; flex-shrink: 0; transition: opacity var(--ease), color var(--ease);
+}
+.store-item:hover .store-del, .store-item:hover .store-ren { opacity: 1; }
+.store-del:hover { color: #D9534F; background: rgba(217, 83, 79, 0.12); }
+.store-ren:hover { color: var(--accent); background: rgba(60, 120, 255, 0.12); }
+.store-empty { padding: 8px 4px; font-size: 12px; }
+.store-hint { padding: 10px 4px 0; font-size: 11px; line-height: 1.5; }
+
+/* ---------- 「回到最新」浮动按钮(不在底部时出现) ---------- */
+#chat-input-wrap { position: relative; }
+.scroll-bottom-btn {
+  position: absolute;
+  right: 12px;
+  /* 定位到输入区上方:随输入框/附件预览高度自适应,不会被撑高后遮住 */
+  bottom: calc(100% + 2px);
+  width: 34px; height: 34px;
+  border-radius: 50%;
+  border: 1px solid var(--glass-border);
+  background: var(--glass-l1);
+  backdrop-filter: var(--blur);
+  -webkit-backdrop-filter: var(--blur);
+  color: var(--accent);
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  box-shadow: var(--glass-inner-glow), var(--glass-shadow-soft);
+  transition: opacity 200ms ease, transform 200ms ease;
+  z-index: 20;
+}
+.scroll-bottom-btn:hover { transform: translateY(-2px); background: rgba(60, 120, 255, 0.14); }
+.scroll-bottom-btn.hidden { display: none; }

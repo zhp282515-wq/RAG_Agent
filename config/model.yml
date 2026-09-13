@@ -1,4 +1,8 @@
 model: openai:qwen3.8-flash
+# 上下文压缩(摘要)专用模型:与对话模型解耦,取更小更快的一档
+summary_model: openai:qwen3.7-flash
+summary_max_tokens: 4000     # 摘要输出上限。注意 qwen3.7-flash 是思维链模型,该上限
+                             # 包含推理 token,设太小会把摘要正文截断(实测 500 即截断)
 emb_model: qwen3.7-text-embedding-flash
 
 rerank_model: qwen3.7-text-rerank

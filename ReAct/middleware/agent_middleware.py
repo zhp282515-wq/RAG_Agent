@@ -27,8 +27,13 @@ _tool_step_emitter = threading.local()
 
 
 def new_trace_holder() -> dict:
-    """server.py 用于注入 context 的收集器:{events, sources, report, meta}。"""
-    return {"events": [], "sources": None, "report": False, "meta": {}, "_ph": 0}
+    """server.py 用于注入 context 的收集器:{events, sources, report, meta, usage}。
+
+    usage: 本轮 token 用量聚合(模型调用累加 + embedding/rerank 工具消耗),
+           以及 _usage_v 版本号(供 SSE 侧增量推送,见 server.drain_ctx)。
+    """
+    return {"events": [], "sources": None, "report": False, "meta": {}, "_ph": 0,
+            "usage": {}, "_usage_v": 0}
 
 
 def _next_ph(holder: dict | None) -> int | None:
@@ -39,12 +44,13 @@ def _next_ph(holder: dict | None) -> int | None:
     return holder["_ph"]
 
 
-def tool_step_emit(name: str, params: dict | None = None, duration: float | None = None) -> None:
+def tool_step_emit(name: str, params: dict | None = None, duration: float | None = None,
+                   tokens: int | None = None) -> None:
     """工具内部调用:向当前请求上报一条细化子步骤(无 web 收集时为空操作)。"""
     em = getattr(_tool_step_emitter, "emit", None)
     if em is None:
         return
-    em(name, params, duration)
+    em(name, params, duration, tokens)
 
 
 def _set_tool_step_emitter(emit) -> None:
@@ -71,6 +77,56 @@ def sources_take() -> list[dict] | None:
     return s
 
 
+# ---------------- 工具内的 token 用量累加 ----------------
+# embedding / rerank 这类工具内部调用拿不到 runtime,无法直接写 trace_holder,
+# 故经线程本地累加器转交(与 sources_set/take 同一套交接思路)。
+# 只在工具执行期间(monitor_tool 的 handler 前后)累加,工具外(文档入库、调试检索)
+# 自动是空操作,不会污染会话统计。
+_tool_usage = threading.local()
+
+
+def usage_active(on: bool) -> None:
+    """monitor_tool 在 handler 前后开关:只有工具执行期间的用量才计入。"""
+    _tool_usage.active = bool(on)
+
+
+def usage_add(kind: str, tokens: int) -> None:
+    """累加某类工具的 token 消耗(embedding / rerank)。工具外调用为空操作。"""
+    try:
+        if not getattr(_tool_usage, "active", False) or tokens <= 0:
+            return
+        total = getattr(_tool_usage, "total", None)
+        if total is None:
+            total = _tool_usage.total = {}
+            _tool_usage.since = {}
+        total[kind] = total.get(kind, 0) + int(tokens)
+        _tool_usage.since[kind] = _tool_usage.since.get(kind, 0) + int(tokens)
+    except Exception:
+        pass
+
+
+def usage_take_since(kind: str) -> int:
+    """取走自上次调用以来某类工具的累计消耗,并把游标归零(供分步归因)。"""
+    since = getattr(_tool_usage, "since", None)
+    if not since:
+        return 0
+    v = int(since.get(kind, 0))
+    since[kind] = 0
+    return v
+
+
+def usage_total() -> dict:
+    """本轮工具消耗总计(kind -> tokens)。"""
+    return dict(getattr(_tool_usage, "total", None) or {})
+
+
+def usage_reset() -> None:
+    """清空累加器(每轮 stream_output 开始时调用,避免跨轮串味)。"""
+    _tool_usage.total = {}
+    _tool_usage.since = {}
+    _tool_usage.active = False
+
+
 def _trace_of(runtime) -> dict | None:
     ctx = getattr(runtime, "context", None)
     return ctx.get(TRACE_KEY) if isinstance(ctx, dict) else None
@@ -78,11 +134,14 @@ def _trace_of(runtime) -> dict | None:
 
 def trace_emit(runtime, step: str, action: str = "phase",
                name: str | None = None, duration: float | None = None,
-               params: dict | None = None, ph_id: int | None = None) -> None:
+               params: dict | None = None, ph_id: int | None = None,
+               tokens: int | None = None) -> None:
     """向当前请求的 trace 收集器追加一条事件;未开启收集(CLI)时为空操作。
 
     ph_id: 阶段 id(phase_start 分配);phase_end/substep 带同一 id 供前端精确配对,
            避免同名阶段(如多轮"检索"或并行工具)时子步骤错挂。
+    tokens: 本步骤的 token 消耗(模型调用的 usage、检索的 embedding+rerank),
+            前端按 k 展示;无可用计量时留空。
     """
     t = _trace_of(runtime)
     if t is None:
@@ -96,6 +155,8 @@ def trace_emit(runtime, step: str, action: str = "phase",
         ev["duration"] = round(duration, 2)
     if params:
         ev["params"] = params
+    if tokens is not None:
+        ev["tokens"] = int(tokens)
     t["events"].append(ev)
 
 
@@ -165,19 +226,24 @@ def monitor_tool(
         trace_emit(request.runtime, parent_phase, "phase_start",
                    tool_name, None, start_params or None, ph_id=ph_id)
 
-        def _emit_substep(name, params=None, duration=None):
+        def _emit_substep(name, params=None, duration=None, tokens=None):
             if holder is not None:
-                holder["events"].append({
+                ev = {
                     "step": parent_phase, "action": "substep",
                     "ph": ph_id,          # 精确挂到本阶段,而非"最近未闭合"
                     "name": name, "params": params or {},
                     "duration": round(duration, 2) if duration is not None else None,
-                })
+                }
+                if tokens:
+                    ev["tokens"] = int(tokens)
+                holder["events"].append(ev)
 
         _set_tool_step_emitter(_emit_substep)
+        usage_active(True)
         try:
             res = handler(request)
         finally:
+            usage_active(False)
             _clear_tool_step_emitter()
         dur = _time.perf_counter() - t0
 
@@ -190,8 +256,22 @@ def monitor_tool(
                 t["sources"] = srcs
                 end_params = {"命中": len(srcs)}
 
+        # 工具自身消耗的 token(embedding / rerank):作为本阶段 tokens 上报。
+        # 同时把分类累计写进 holder —— 累加器是线程本地的,而读取方(web 的
+        # drain_ctx)跑在另一个线程,只有落到 holder 才能被它看到。
+        tool_tokens = 0
+        totals = usage_total()
+        for kind, val in totals.items():
+            tool_tokens += int(val or 0)
+        t = _trace_of(request.runtime)
+        if t is not None and totals:
+            u = t.setdefault("usage", {})
+            for kind, val in totals.items():
+                u[kind] = int(val or 0)
+            t["_usage_v"] = t.get("_usage_v", 0) + 1
         trace_emit(request.runtime, parent_phase, "phase_end",
-                   tool_name, dur, end_params or None, ph_id=ph_id)
+                   tool_name, dur, end_params or None, ph_id=ph_id,
+                   tokens=tool_tokens or None)
         logger.info(f"【中间件执行】[monitor_tool] 工具{tool_name}执行成功")
 
         t = _trace_of(request.runtime)
@@ -285,9 +365,31 @@ def log_after_model(
         runtime: Runtime
 ):
     t = _trace_of(runtime)
+    # 本次模型调用的 token 用量:state 末条是组装好的 AIMessage,带 usage_metadata。
+    # after_model 每次调用恰好触发一次(而非每个流式分片),故不会重复计数。
+    last = state["messages"][-1] if state.get("messages") else None
+    um = getattr(last, "usage_metadata", None) or {}
+    inp = int(um.get("input_tokens", 0) or 0)
+    out = int(um.get("output_tokens", 0) or 0)
+    tot = int(um.get("total_tokens", 0) or 0) or (inp + out)
+    reason = int((um.get("output_token_details") or {}).get("reasoning", 0) or 0)
+
     if t is not None and t.get("_model_t0"):
-        trace_emit(runtime, "模型", "phase_end", None, _time.perf_counter() - t["_model_t0"])
+        trace_emit(runtime, "模型", "phase_end", None,
+                   _time.perf_counter() - t["_model_t0"],
+                   {"输入": inp, "输出": out, "推理": reason, "合计": tot} if tot else None,
+                   tokens=tot or None)
         t["_model_t0"] = None
+        if tot:
+            u = t.setdefault("usage", {})
+            u["model_in"] = u.get("model_in", 0) + inp
+            u["model_out"] = u.get("model_out", 0) + out
+            u["model_reason"] = u.get("model_reason", 0) + reason
+            u["model_total"] = u.get("model_total", 0) + tot
+            u["calls"] = u.get("calls", 0) + 1
+            # 上下文体积 = 本次调用的输入量(前端进度条口径)
+            u["context"] = inp
+            t["_usage_v"] = t.get("_usage_v", 0) + 1
     logger.info(f"【中间件执行】[log_after_model] 模型调用完成 带有{len(state['messages'])}条消息")
     logger.debug(f"【中间件执行】[log_after_model] {type(state['messages'][-1]).__name__} | 消息内容如下:\n{_content_preview(state['messages'][-1].content, limit=100)}")
     return None

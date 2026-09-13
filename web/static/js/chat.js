@@ -17,6 +17,7 @@ const ChatUI = {
     // 走一遍,给每条 assistant 配对它前一条 user 的请求(重新生成历史回答用)
     const out = [];
     let lastUserReq = null;
+    let lastCtx = 0;
     for (const m of msgs) {
       if (m.role === "user") {
         lastUserReq = { query: m.content || "" };
@@ -33,11 +34,17 @@ const ChatUI = {
         workflow: m.workflow || [],
         images: m.images || [],
         docs: m.docs || [],
+        usage: m.usage || null,
       };
       if (m.role === "assistant" && lastUserReq) item._req = lastUserReq;
+      if (m.role === "assistant" && m.usage && m.usage.context) lastCtx = m.usage.context;
       out.push(item);
     }
     this.messages = out;
+    // 进度条:以最近一条 assistant 的 context 为准(它代表该会话当前的工作记忆体积)
+    ContextMeter.seed(lastCtx);
+    // 打开会话默认看最新内容 → 重置为贴底跟随
+    this._stick = true;
     this.draw();
   },
 
@@ -48,6 +55,10 @@ const ChatUI = {
 
   draw() {
     const box = document.getElementById("chat-messages");
+    // innerHTML 重建会丢掉滚动位置:先记下用户当前是否贴底,重建后据此恢复。
+    // 贴底 → 跟随到底部;否则 → 停在原来的位置,别把正在翻历史的用户拽走。
+    const follow = this._stick !== false;
+    const prevTop = box.scrollTop;
     box.innerHTML = "";
     if (!this.messages.length) {
       box.innerHTML = `
@@ -58,7 +69,8 @@ const ChatUI = {
       return;
     }
     for (const m of this.messages) box.appendChild(this.buildMsg(m));
-    box.scrollTop = box.scrollHeight;
+    box.scrollTop = follow ? box.scrollHeight : prevTop;
+    this._syncJumpBtn();
   },
 
   buildMsg(m) {
@@ -183,6 +195,8 @@ const ChatUI = {
 
     this.sending = true;
     this.lastUserQuery = text;
+    // 用户主动发消息 → 重新贴底跟随(他显然想看这一轮的回答)
+    this._stick = true;
     this.messages.push({
       role: "user", content: text, sources: [], images: (images || []).map((i) => i.path),
       docs: (docs || []).map((d) => ({ name: d.name })),
@@ -231,13 +245,16 @@ const ChatUI = {
     const renderMdLive = () => {
       const b = bubbleEl();
       if (!b) return;
+      // 先记录"用户此刻是否贴底":md 重绘会整块替换 innerHTML,内容高度突变,
+      // 必须用替换前的状态决定是否跟随,否则会被误判成"用户滑上去了"。
+      const follow = this._stick !== false;
       const t0 = performance.now();
       b.innerHTML = this.mdToHtml(asst.content);
       const cost = performance.now() - t0;
       // 自适应:单次渲染越久,间隔越拉大;渲染很轻则贴近 60ms 保持跟手
       baseMs = cost > 25 ? Math.min(320, baseMs + 40) : Math.max(60, baseMs - 10);
       lastShownLen = asst.content.length;
-      this.scrollBottom();
+      if (follow) this.scrollBottom();
     };
 
     const appendPlain = () => {
@@ -245,9 +262,10 @@ const ChatUI = {
       if (!b) return;
       const chunk = asst.content.slice(lastShownLen);
       if (chunk) {
+        const follow = this._stick !== false;
         b.appendChild(document.createTextNode(chunk));
         lastShownLen = asst.content.length;
-        this.scrollBottom();
+        if (follow) this.scrollBottom();
       }
     };
 
@@ -295,6 +313,16 @@ const ChatUI = {
         asst.workflow.push(tr);
         LiveStatus.onEvent(tr);
       },
+      onCtx: (c) => {
+        // 上下文占用:更新进度条;有 compressed 时条会先冲满再回落
+        ContextMeter.update(c);
+        // 累计本轮的计费总量/推理量(服务端权威值),供"执行完成"汇总行使用
+        asst.usage = Object.assign({}, asst.usage, {
+          context: c.used || (asst.usage && asst.usage.context),
+          total: c.total != null ? c.total : (asst.usage && asst.usage.total),
+          reason: c.reason != null ? c.reason : (asst.usage && asst.usage.reason),
+        });
+      },
       onSources: (srcs) => {
         asst.sources = srcs || [];
         this.draw();  // 重绘整屏:每答从各自的 m.sources 渲染,溯源记录可用
@@ -323,8 +351,63 @@ const ChatUI = {
   },
 
   scrollBottom() {
+    // 仅在用户"贴着底部看"时才自动跟随。用户上滑翻阅历史时不再把他拽回底部
+    // (流式输出每 ~60ms 就会调到这里,无条件拉底会让人根本没法往回看)。
+    if (!this._stick) return;
     const box = document.getElementById("chat-messages");
+    if (!box) return;
     box.scrollTop = box.scrollHeight;
+  },
+
+  /** 绑定滚动监听:记录用户是否处于"贴底"状态。
+
+   *  不能只看 scroll 事件:流式 markdown 每次重绘都会整块替换 innerHTML,
+   *  scrollHeight 突变也会触发 scroll,会被误判成"用户滑上去了" → 跟随静默失效。
+   *  故只用真实的用户操作(滚轮/触摸/拖滚动条)断开跟随;回到贴底则永远恢复。
+   */
+  initScrollFollow() {
+    const box = document.getElementById("chat-messages");
+    if (!box) return;
+    this._stick = true;
+    const GAP = 40;                       // 容差(px),避免像素级抖动误判
+    const gap = () => box.scrollHeight - box.scrollTop - box.clientHeight;
+
+    const markUser = () => {
+      this._userScrolling = true;
+      clearTimeout(this._scrollIdle);
+      this._scrollIdle = setTimeout(() => { this._userScrolling = false; }, 250);
+    };
+
+    box.addEventListener("scroll", () => {
+      if (gap() <= GAP) this._stick = true;                // 贴底 → 总是恢复跟随
+      else if (this._userScrolling) this._stick = false;   // 仅用户主动上滑才断开
+      this._syncJumpBtn();
+    }, { passive: true });
+    box.addEventListener("wheel", markUser, { passive: true });
+    box.addEventListener("touchmove", markUser, { passive: true });
+    box.addEventListener("mousedown", markUser);          // 拖滚动条
+  },
+
+  /** 「回到最新」浮动按钮:仅在未贴底(用户正在翻阅历史)时显示。
+
+   *  顺便做跟随状态自愈:只要几何上已经贴底,就把 _stick 复位。
+   *  否则流式收尾/重绘等边界时序可能留下 stick=false 的残状态,让按钮无端常驻。
+   */
+  _syncJumpBtn() {
+    const btn = document.getElementById("btn-scroll-bottom");
+    const box = document.getElementById("chat-messages");
+    if (!btn || !box) return;
+    const gap = box.scrollHeight - box.scrollTop - box.clientHeight;
+    if (gap <= 40) this._stick = true;
+    btn.classList.toggle("hidden", this._stick !== false);
+  },
+
+  /** 点按钮:跳回底部并恢复跟随 */
+  jumpToBottom() {
+    this._stick = true;
+    const box = document.getElementById("chat-messages");
+    if (box) box.scrollTop = box.scrollHeight;
+    this._syncJumpBtn();
   },
 
   setInputEnabled(on) {
@@ -425,6 +508,7 @@ const WF = {
         name: ev.name || "步骤",
         params: ev.params || {},
         dur: ev.duration != null ? Number(ev.duration) : null,
+        tok: ev.tokens != null ? Number(ev.tokens) : null,
       });
     };
 
@@ -461,11 +545,13 @@ const WF = {
         if (found >= 0) {
           stages[found].dur = ev.duration != null ? Number(ev.duration) : null;
           stages[found].state = "done";
+          if (ev.tokens != null) stages[found].tok = Number(ev.tokens);
           if (ev.params) stages[found].params = Object.assign({}, stages[found].params, ev.params);
         } else {
           stages.push({
             step, name: ev.name || "", params: ev.params || {}, realT0: now,
             dur: ev.duration != null ? Number(ev.duration) : null, state: "done", children: [],
+            tok: ev.tokens != null ? Number(ev.tokens) : null,
           });
         }
       } else if (act === "substep") {
@@ -516,6 +602,19 @@ const WF = {
     return (sec >= 60 ? (sec / 60).toFixed(1) + " 分钟" : Number(sec).toFixed(2) + "s");
   },
 
+  /** token 数 → "1.2k" 简写(不满千按原值) */
+  fmtTok(n) {
+    const v = Number(n);
+    if (!isFinite(v) || v <= 0) return "";
+    return v >= 1000 ? (v / 1000).toFixed(1) + "k" : String(Math.round(v));
+  },
+
+  /** 某事件的 token 徽标(无计量则空) */
+  tokBadge(n) {
+    const s = WF.fmtTok(n);
+    return s ? `<span class="wf-step-tok">${s} tok</span>` : "";
+  },
+
   /** 阶段 → 左侧标记(绿勾=完成,spinner=进行中) */
   iconFor(s) {
     return s.state === "running"
@@ -533,7 +632,7 @@ const WF = {
     return `${step} 处理中…`;
   },
 
-  /** 重要参数可视化(检索词/命中数/用户/月份/上下文条数/子步) */
+  /** 重要参数可视化(检索词/命中数/用户/月份/上下文条数/子步/压缩量) */
   paramsText(params) {
     if (!params) return "";
     const parts = [];
@@ -547,6 +646,15 @@ const WF = {
     if (params["剔除低相关"] != null) parts.push(`剔除 ${params["剔除低相关"]} 条`);
     if (params["说明"]) parts.push(`${params["说明"]}`);
     if (params["阶段"]) parts.push(`${params["阶段"]}`);
+    // 上下文压缩:压缩前后与省下的量
+    if (params["压缩前"] != null) parts.push(`压缩前 ${params["压缩前"]}`);
+    if (params["压缩后"] != null) parts.push(`压缩后 ${params["压缩后"]}`);
+    if (params["省下"] != null) parts.push(`省下 ${params["省下"]}`);
+    if (params["保留消息数"] != null) parts.push(`保留 ${params["保留消息数"]} 条原文`);
+    // 模型调用的输入/输出/推理(合计走 tokens 徽标,不在此重复)
+    if (params["输入"] != null) parts.push(`输入 ${WF.fmtTok(params["输入"])}`);
+    if (params["输出"] != null) parts.push(`输出 ${WF.fmtTok(params["输出"])}`);
+    if (params["推理"] != null && Number(params["推理"]) > 0) parts.push(`推理 ${WF.fmtTok(params["推理"])}`);
     return parts.join(" · ");
   },
 
@@ -554,6 +662,7 @@ const WF = {
   stageRow(s) {
     const el = document.createElement("div");
     el.className = "wf-step " + (s.state === "running" ? "running" : "done");
+    const tokLabel = s.state === "running" ? "" : WF.tokBadge(s.tok);
     const durLabel = s.state === "running"
       ? `<span class="wf-running" data-real="${s.realT0}">${WF.runningAction(s)} (${WF.fmtDur((performance.now() - s.realT0) / 1000)})</span>`
       : (s.dur != null ? `<span class="wf-step-dur">${WF.fmtDur(s.dur)}</span>` : "");
@@ -566,13 +675,14 @@ const WF = {
     if (s.children && s.children.length) {
       const rows = s.children.map((c) => {
         const cDur = c.dur != null ? `<span class="wf-step-dur">${WF.fmtDur(c.dur)}</span>` : "";
+        const cTok = WF.tokBadge(c.tok);
         const cSub = WF.paramsText(c.params);
         return `
           <div class="wf-substep">
             <span class="wf-substep-dot"></span>
             <div class="wf-substep-main">
               <div class="wf-step-top">
-                <span class="wf-substep-title"><span class="wf-substep-name">${WF.esc(c.name)}</span></span>${cDur}
+                <span class="wf-substep-title"><span class="wf-substep-name">${WF.esc(c.name)}</span></span>${cTok}${cDur}
               </div>
               ${cSub ? `<div class="wf-step-params">${WF.esc(cSub)}</div>` : ""}
             </div>
@@ -587,7 +697,7 @@ const WF = {
       <div class="wf-step-main">
         <div class="wf-step-top">
           <span class="wf-step-title"><span class="wf-step-name">${WF.esc(s.step)}</span>${tool}</span>
-          ${durLabel}
+          ${tokLabel}${durLabel}
         </div>
         ${desc ? `<div class="wf-step-desc">${WF.esc(desc)}</div>` : ""}
         ${sub ? `<div class="wf-step-params">${WF.esc(sub)}</div>` : ""}
@@ -599,6 +709,38 @@ const WF = {
   esc(s) {
     return String(s ?? "").replace(/[&<>"']/g, (c) =>
       ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  },
+
+  /** 底部「执行完成」汇总行(面板与弹窗共用,避免两处各写一份导致显示不一致)。
+   *
+   *  耗时:各 phase_end duration 之和。
+   *  token:优先用落库的 usage.total(计费总量);历史消息无 usage 时退化为累加各事件 tokens。
+   *  另列出推理 token —— qwen3.8-flash 是思维链模型,推理常是成本大头。
+   */
+  totalRow(events, usage) {
+    const done = (events || []).filter((e) => e.action === "phase_end" && e.duration != null);
+    // 只累加 phase_end 的 tokens:子步骤的消耗已包含在其父阶段里,
+    // 两者都加会把检索这类多子步骤的工具算两遍。
+    const sumTok = (events || []).reduce(
+      (a, e) => a + (e.action === "phase_end" ? (Number(e.tokens) || 0) : 0), 0);
+    const tokens = usage && usage.total != null ? Number(usage.total) : sumTok;
+    const reason = usage && usage.reason != null ? Number(usage.reason) : 0;
+    const totalDur = done.reduce((s, e) => s + Number(e.duration), 0);
+
+    const badges = [];
+    if (tokens > 0) badges.push(`<span class="wf-step-tok">共 ${WF.fmtTok(tokens)} tok</span>`);
+    if (reason > 0) badges.push(`<span class="wf-step-tok">推理 ${WF.fmtTok(reason)}</span>`);
+    if (done.length) badges.push(`<span class="wf-step-dur">共 ${WF.fmtDur(totalDur)}</span>`);
+    if (!badges.length) return null;
+
+    const el = document.createElement("div");
+    el.className = "wf-step done wf-total";
+    el.innerHTML = `
+      <span class="wf-step-icon"><span class="wf-done-ic">${ic("check", "ic-xs")}</span></span>
+      <div class="wf-step-main">
+        <div class="wf-step-top"><span class="wf-step-name">执行完成</span>${badges.join("")}</div>
+      </div>`;
+    return el;
   },
 };
 
@@ -657,20 +799,11 @@ const WorkflowPanel = {
     const last = ChatUI.messages[ChatUI.messages.length - 1];
     const events = (last && last.workflow) ? last.workflow : [];
     this.render(events);
-    // 统计各阶段耗时合计,底部补总耗时(排除"完成"占位)
-    const done = events.filter((e) => e.action === "phase_end" && e.duration != null);
-    if (done.length) {
-      const total = done.reduce((s, e) => s + Number(e.duration), 0);
-      const box = document.getElementById("workflow-steps");
-      const el = document.createElement("div");
-      el.className = "wf-step done wf-total";
-      el.innerHTML = `
-        <span class="wf-step-icon"><span class="wf-done-ic">${ic("check", "ic-xs")}</span></span>
-        <div class="wf-step-main">
-          <div class="wf-step-top"><span class="wf-step-name">执行完成</span>
-            <span class="wf-step-dur">共 ${WF.fmtDur(total)}</span></div>
-        </div>`;
-      box.appendChild(el);
+    // 底部汇总行(耗时 + token):与工作流弹窗共用同一个渲染函数
+    const box = document.getElementById("workflow-steps");
+    const row = WF.totalRow(events, last && last.usage);
+    if (row) {
+      box.appendChild(row);
       box.scrollTop = box.scrollHeight;
     }
   },
@@ -691,19 +824,8 @@ const WorkflowModal = {
     const list = document.createElement("div");
     for (const s of stages) list.appendChild(WF.stageRow(s));
     body.appendChild(list);
-    const done = (events || []).filter((e) => e.action === "phase_end" && e.duration != null);
-    if (done.length) {
-      const total = done.reduce((s, e) => s + Number(e.duration), 0);
-      const foot = document.createElement("div");
-      foot.className = "wf-step done wf-total";
-      foot.innerHTML = `
-        <span class="wf-step-icon"><span class="wf-done-ic">${ic("check", "ic-xs")}</span></span>
-        <div class="wf-step-main"><div class="wf-step-top">
-          <span class="wf-step-name">执行完成</span>
-          <span class="wf-step-dur">共 ${WF.fmtDur(total)}</span>
-        </div></div>`;
-      body.appendChild(foot);
-    }
+    const row = WF.totalRow(events, msg.usage);
+    if (row) body.appendChild(row);
     document.getElementById("wf-modal").classList.remove("hidden");
   },
 
@@ -740,6 +862,89 @@ const SourcesModal = {
   esc(s) {
     return String(s).replace(/[&<>"']/g, (c) =>
       ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  },
+};
+
+/* ---------- 会话上下文占用进度条 ----------
+ * 分母是「摘要触发阈值」(非模型 1M 硬上限):1M 窗口下日常会话占比极低,
+ * 按 1M 算进度条会长期贴着 0%,看不出变化;按阈值算则"满格 = 即将压缩",有实际含义。
+ *
+ * 数值口径 = 最后一次模型调用的 input_tokens(真实计量),与后端触发判定同源。
+ * 压缩发生时先冲到 100% 再过渡回落,让用户看见"上下文被压缩了"。
+ */
+const ContextMeter = {
+  _limit: 200000,        // 由后端 /api/settings 或首个 usage 事件校正
+  _used: 0,
+  _visible: false,
+
+  init(limit) {
+    if (limit > 0) this._limit = limit;
+    this._el = document.getElementById("ctx-meter");
+    this._fillEl = document.getElementById("ctx-meter-fill");
+    this._textEl = document.getElementById("ctx-meter-text");
+    this._wrapEl = document.getElementById("ctx-meter-wrap");
+  },
+
+  /** 按后端给的阈值刷新分母 */
+  setLimit(limit) {
+    if (limit > 0 && limit !== this._limit) {
+      this._limit = limit;
+      if (this._visible) this.render();
+    }
+  },
+
+  /** 更新占用(SSE ctx 事件 / 历史会话恢复)。
+   *  payload: {used, limit?, compressed?:{before, after}} */
+  update(payload) {
+    if (!payload) return;
+    if (payload.limit > 0) this._limit = payload.limit;
+    const used = Number(payload.used || 0);
+    if (!used) return;
+    this._used = used;
+    this.show();
+    // 压缩:先把条冲到 100% 给个视觉反馈,再过渡到压缩后的位置
+    if (payload.compressed) {
+      this._used = Number(payload.compressed.before || used);
+      this.render(true);
+      setTimeout(() => {
+        this._used = Number(payload.compressed.after || used);
+        this.render();
+      }, 420);
+      return;
+    }
+    this.render();
+  },
+
+  /** 历史会话切换:用落库的 usage.context 恢复;无记录则隐藏 */
+  seed(contextTokens) {
+    const v = Number(contextTokens || 0);
+    if (!v) { this.hide(); return; }
+    this._used = v;
+    this.show();
+    this.render();
+  },
+
+  show() {
+    if (this._visible) return;
+    this._visible = true;
+    if (this._wrapEl) this._wrapEl.classList.remove("hidden");
+  },
+
+  hide() {
+    this._visible = false;
+    if (this._wrapEl) this._wrapEl.classList.add("hidden");
+  },
+
+  render(full) {
+    if (!this._fillEl) return;
+    const pct = full ? 100 : Math.min(100, Math.round((this._used / this._limit) * 100));
+    this._fillEl.style.width = pct + "%";
+    // 接近阈值时变色预警(>80% 偏橙,满格红)
+    this._fillEl.className = "ctx-fill" + (pct >= 100 ? " full" : pct >= 80 ? " warn" : "");
+    if (this._textEl) {
+      this._textEl.textContent = `${WF.fmtTok(this._used)} / ${WF.fmtTok(this._limit)}`;
+    }
+    if (this._wrapEl) this._wrapEl.title = `当前上下文约 ${this._used.toLocaleString()} tokens,达 ${this._limit.toLocaleString()} 时自动压缩历史`;
   },
 };
 
@@ -911,6 +1116,14 @@ document.addEventListener("DOMContentLoaded", () => {
   const input = document.getElementById("chat-input");
   const sendBtn = document.getElementById("btn-send");
   ModelPicker.init();
+  ContextMeter.init();
+  ChatUI.initScrollFollow();
+  const jumpBtn = document.getElementById("btn-scroll-bottom");
+  if (jumpBtn) jumpBtn.addEventListener("click", () => ChatUI.jumpToBottom());
+  // 进度条分母取后端阈值(与摘要触发判定同源);失败则保留默认 200k
+  API.get("/api/settings")
+    .then((s) => { if (s && s.context_limit) ContextMeter.setLimit(s.context_limit); })
+    .catch(() => {});
 
   const doSend = () => {
     const q = input.value.trim();

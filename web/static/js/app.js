@@ -5,7 +5,7 @@
 const App = {
   currentView: "chat",
 
-  /** 侧栏显示模式:会话(sessions) or 系统配置子栏(config) */
+  /** 侧栏显示模式:sessions(会话) / config(系统配置子栏) / stores(向量库) */
   sidebarMode: "sessions",
 
   switchView(view) {
@@ -14,24 +14,34 @@ const App = {
       t.classList.toggle("active", t.dataset.view === view));
     document.querySelectorAll(".view").forEach((v) =>
       v.classList.toggle("active", v.id === `view-${view}`));
-    // 系统配置页:侧栏切为配置子栏;其余页切回会话管理
-    if (view === "config") this.showConfigSidebar(true);
-    else if (this.sidebarMode === "config") this.showConfigSidebar(false);
+    // 侧栏随页面联动:系统配置 → 配置子栏;知识库 → 向量库列表;其余 → 会话管理
+    if (view === "config") this.showSidebar("config");
+    else if (view === "docs") this.showSidebar("stores");
+    else this.showSidebar("sessions");
     // 各页进入时刷新数据
-    if (view === "docs") DocsUI.refresh();
+    if (view === "docs") DocsUI.refreshStores().then(() => DocsUI.refresh());
     if (view === "chat") ChatUI.scrollBottom();
     if (view === "debug") DebugUI.prefill();
     if (view === "config") ConfigUI.refresh();
   },
 
-  /* ---------- 侧栏内容切换:会话管理 <-> 系统配置子栏 ---------- */
+  /* ---------- 侧栏内容切换:会话管理 <-> 系统配置子栏 <-> 向量库列表 ---------- */
+  showSidebar(mode) {
+    const panels = {
+      sessions: document.getElementById("sidebar-sessions"),
+      config: document.getElementById("sidebar-config"),
+      stores: document.getElementById("sidebar-stores"),
+    };
+    if (!panels[mode]) return;
+    this.sidebarMode = mode;
+    for (const [k, el] of Object.entries(panels)) {
+      if (el) el.classList.toggle("hidden", k !== mode);
+    }
+  },
+
+  /** 兼容旧调用点 */
   showConfigSidebar(on) {
-    const s = document.getElementById("sidebar-sessions");
-    const c = document.getElementById("sidebar-config");
-    if (!s || !c) return;
-    this.sidebarMode = on ? "config" : "sessions";
-    s.classList.toggle("hidden", on);
-    c.classList.toggle("hidden", !on);
+    this.showSidebar(on ? "config" : "sessions");
   },
 
   /* ---------- 深色模式 ---------- */

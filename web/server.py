@@ -93,7 +93,7 @@ def _label(score: float) -> str:
 # ---------------- 服务单例(惰性,首次请求才初始化重型组件) ----------------
 # agent 按 (model, temperature) 缓存:同参复用同一 ReActAgentService(避免反复重建 agent)
 _agent_cache: dict[str, ReActAgentService] = {}
-_vector_svc: VectorStoreService | None = None
+_vector_svc: dict[str, VectorStoreService] = {}
 
 
 def _default_temperature() -> float | None:
@@ -112,6 +112,20 @@ def _default_model() -> str:
         return str(v or "").strip()
     except Exception:
         return ""
+
+
+def _context_limit() -> int:
+    """上下文进度条分母 = agent.yml 的摘要触发阈值。
+
+    与后端 TracedSummarizationMiddleware 读的是同一个配置项,故进度条满格
+    与「即将压缩」是同一个时刻,不会出现条满了却没压缩的错觉。
+    """
+    try:
+        from utils.config_tool import agent_conf
+        sess = agent_conf.get("session") or {}
+        return int(sess.get("trigger_tokens", 200000))
+    except Exception:
+        return 200000
 
 
 def _registry_rev() -> int:
@@ -150,11 +164,28 @@ def _get_agent(model: str | None = None) -> ReActAgentService:
     return svc
 
 
-def _get_vector() -> VectorStoreService:
+def _current_store() -> str | None:
+    """系统配置里选定的当前向量库;未设则 None(服务层回退 yml 默认)。"""
+    try:
+        v = str(_settings("rag.current_store", "") or "").strip()
+        return v or None
+    except Exception:
+        return None
+
+
+def _get_vector(store: str | None = None) -> VectorStoreService:
+    """取向量库服务。传入 store(或系统配置未设时取当前库)→ 按库缓存实例。
+
+    按 collection 缓存:切库后不必重建,但也必须区分开——否则会拿旧库的服务
+    去查新库(collection 是构造函数入参,实例一旦建好不会变)。
+    """
     global _vector_svc
-    if _vector_svc is None:
-        _vector_svc = VectorStoreService()
-    return _vector_svc
+    name = (store or "").strip() or _current_store() or ""
+    svc = _vector_svc.get(name)
+    if svc is None:
+        svc = VectorStoreService(collection_name=name or None)
+        _vector_svc[name] = svc
+    return svc
 
 
 @asynccontextmanager
@@ -199,7 +230,7 @@ async def _no_cache_static(request: Request, call_next):
 @app.get("/")
 def index():
     # 服务端 302 到带版本参数的页面(比本地跳转页更可靠:浏览器直接发全新请求,绕开缓存)
-    return RedirectResponse("/static/index.html?v=36")
+    return RedirectResponse("/static/index.html?v=37")
 
 
 # ---------------- 工具函数 ----------------
@@ -333,6 +364,7 @@ async def _chat_event_gen(query: str, session_id: str | None,
     q: asyncio.Queue = asyncio.Queue()
     sent_events = 0
     sent_sources = None
+    sent_usage_v = 0
     answer_parts: list[str] = []
 
     def drain_trace() -> list[dict]:
@@ -349,6 +381,34 @@ async def _chat_event_gen(query: str, session_id: str | None,
             sent_sources = srcs
             return srcs
         return None
+
+    def drain_ctx() -> dict | None:
+        """上下文占用的增量推送(中间件每次模型调用后 +1 版本号)。
+
+        独立成顶层事件而非挂在 trace 上:进度条是常驻 UI,挂 trace 会让落库的
+        workflow 数组无谓膨胀。used = 最后一次模型调用的 input_tokens(真实上下文体积)。
+        limit 由 UI 从 /api/settings 取,这里不重复下发。
+
+        total/reason:本轮计费总量与其中推理占比,由服务端权威计算(工具消耗记在线程本地,
+        前端无法自行求和),供工作流"执行完成"汇总行直接使用。
+        """
+        nonlocal sent_usage_v
+        v = holder.get("_usage_v", 0)
+        if not v or v == sent_usage_v:
+            return None
+        sent_usage_v = v
+        u = dict(holder.get("usage", {}) or {})
+        payload = {"used": int(u.get("context", 0) or 0)}
+        if u.get("compressed"):
+            payload["compressed"] = u["compressed"]
+        try:
+            turn = svc._turn_usage(holder)
+            if turn.get("total"):
+                payload["total"] = turn["total"]
+                payload["reason"] = turn.get("reason", 0)
+        except Exception:
+            pass
+        return payload
 
     def producer():
         """后台线程:消费同步生成器,产出 ('token', str) / ('done', None) / ('err', str)。"""
@@ -387,6 +447,9 @@ async def _chat_event_gen(query: str, session_id: str | None,
             srcs = drain_sources()
             if srcs is not None:
                 yield _sse({"sources": srcs})
+            ctx = drain_ctx()
+            if ctx is not None:
+                yield _sse({"ctx": ctx})
 
             try:
                 kind, payload = await asyncio.wait_for(q.get(), timeout=0.15)
@@ -407,12 +470,15 @@ async def _chat_event_gen(query: str, session_id: str | None,
         # 生产线程是 daemon,主生成器退出即可,无需 join
         pass
 
-    # 收尾:剩余 trace/sources + 完成事件;报告场景自动落库
+    # 收尾:剩余 trace/sources/ctx + 完成事件;报告场景自动落库
     for ev in drain_trace():
         yield _sse({"trace": ev})
     srcs = drain_sources()
     if srcs is not None:
         yield _sse({"sources": srcs})
+    ctx = drain_ctx()
+    if ctx is not None:
+        yield _sse({"ctx": ctx})
     answer = "".join(answer_parts)
     if holder["report"] and answer.strip():
         _save_report(holder, answer)
@@ -539,6 +605,8 @@ def api_get_settings():
         "temperature": s.get("model.temperature"),
         "api_key_configured": has_key,
         "api_key_is_db": key_is_db,
+        # 上下文进度条分母 = 摘要触发阈值(与后端触发判定同一个数,避免两边漂移)
+        "context_limit": _context_limit(),
         "retrieval": {
             "top_k": s.get("retrieval.top_k"),
             "rerank_n": s.get("retrieval.rerank_n"),
@@ -726,7 +794,9 @@ def api_search(body: dict):
     rerank_n = int(_settings("retrieval.rerank_n", 5) or 5)
 
     # 与 agent 工具同一条检索链路(向量粗排 + rerank 精排),分数体系与阈值一致
-    hits = _get_vector().get_rerank_retriever(top_k=top_k, rerank_n=rerank_n)(query)
+    # 检索库与 agent 一致:走当前向量库设置
+    vec = _get_vector()
+    hits = vec.get_rerank_retriever(top_k=top_k, rerank_n=rerank_n)(query)
     out = []
     for h in hits:
         score = float(h.get("score", 0))
@@ -745,21 +815,103 @@ def api_search(body: dict):
     return {"hits": out}
 
 
-# ---------------- 6. 文档管理(知识库) ----------------
+# ---------------- 6. 向量库管理 + 文档管理(知识库) ----------------
+@app.get("/api/stores")
+def api_list_stores():
+    """向量库列表 + 当前选中库。"""
+    svc = _get_vector()
+    return {"stores": svc.list_stores(), "current": svc.collection_name}
+
+
+@app.post("/api/stores")
+def api_create_store(body: dict):
+    """新建向量库。body: {name}"""
+    name = str((body or {}).get("name") or "").strip()
+    try:
+        res = _get_vector().create_store(name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        logger.error(f"api_create_store: 新建 {name} 失败: {e}")
+        raise HTTPException(500, f"新建向量库失败:{e}")
+    return {"ok": True, **res}
+
+
+@app.delete("/api/stores/{name}")
+def api_drop_store(name: str):
+    """删除向量库(连同其中全部分片,不可恢复)。删的是当前库时回退默认库。"""
+    if not _get_vector().drop_store(name):
+        raise HTTPException(404, f"向量库不存在:{name}")
+    # 若删掉的正是当前库,把设置回落默认库,避免后续检索指向已删的库
+    if (_current_store() or "") == name:
+        try:
+            from utils.settings_store import set_json
+            from utils.config_tool import vector_store_conf
+            set_json("rag.current_store",
+                     vector_store_conf.get("collection_name", "document_chunks"))
+            logger.info(f"api_drop_store: 当前库被删,已回退默认库")
+        except Exception as e:
+            logger.warning(f"api_drop_store: 回退当前库设置失败: {e}")
+    _vector_svc.pop(name, None)
+    return {"ok": True, "name": name}
+
+
+@app.put("/api/stores/current")
+def api_set_current_store(body: dict):
+    """切换当前检索库。body: {name}"""
+    from utils.settings_store import set_json
+    name = str((body or {}).get("name") or "").strip()
+    if not name:
+        raise HTTPException(400, "缺少向量库名")
+    names = {s["name"] for s in _get_vector().list_stores()}
+    if name not in names:
+        raise HTTPException(404, f"向量库不存在:{name}")
+    set_json("rag.current_store", name)
+    logger.info(f"api_set_current_store: 当前向量库已切为 {name}")
+    return {"ok": True, "current": name}
+
+
+# 注意:必须声明在 /api/stores/current 之后 —— FastAPI 按注册顺序匹配,
+# 若 {name} 在前,"current" 会被当成库名路由到重命名处理器。
+@app.put("/api/stores/{name}")
+def api_rename_store(name: str, body: dict):
+    """重命名向量库(纯改名,分片数据不动)。body: {name: 新名}
+
+    若改的是当前检索库,同步更新 rag.current_store,否则检索会指向旧名而失效。
+    """
+    from utils.settings_store import set_json
+    new_name = str((body or {}).get("name") or "").strip()
+    try:
+        res = _get_vector().rename_store(name, new_name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        logger.error(f"api_rename_store: {name} -> {new_name} 失败: {e}")
+        raise HTTPException(500, f"重命名失败:{e}")
+    if res.get("renamed") and (_current_store() or "") == name:
+        set_json("rag.current_store", res["name"])
+        logger.info(f"api_rename_store: 当前库已同步改名为 {res['name']}")
+    _vector_svc.pop(name, None)
+    return {"ok": True, **res}
+
+
 @app.post("/api/documents")
-async def api_upload_document(file: UploadFile = File(...)):
-    """上传文档并入库(解析→分片→向量化,耗时操作)。"""
+async def api_upload_document(file: UploadFile = File(...), store: str = ""):
+    """上传文档并入库到指定向量库(解析→分片→向量化,耗时操作)。
+
+    store 缺省则入库到当前库(系统配置选定)。
+    """
     if not file.filename:
         raise HTTPException(400, "缺少文件")
     if not _require_api_key():
         raise HTTPException(403, "未配置模型服务 API Key,请先在「系统配置 → 对话模型」填入 API Key 后再上传入库")
     path = _save_upload(file)
-    vec = _get_vector()
+    vec = _get_vector(store)
 
     if vec.check_md5_hex(path):
         logger.info(f"api_upload_document: {os.path.basename(path)} 已存在(md5 去重)")
         return {"ok": False, "file_name": os.path.basename(path),
-                "message": "该文档已存在(md5 去重)"}
+                "message": "该文档已存在(md5 去重)", "store": vec.collection_name}
 
     if not vec.load_document(path):
         raise HTTPException(400, f"文档解析或入库失败:{os.path.basename(path)}")
@@ -770,19 +922,21 @@ async def api_upload_document(file: UploadFile = File(...)):
             chunk_count = d["chunk_count"]
             break
     return {"ok": True, "file_name": os.path.basename(path),
-            "chunk_count": chunk_count, "message": "已入库"}
+            "chunk_count": chunk_count, "message": "已入库",
+            "store": vec.collection_name}
 
 
 @app.get("/api/documents")
-def api_list_documents():
-    """已入库文档列表:文件名/格式/大小/分片数。"""
-    return {"documents": _get_vector().list_documents()}
+def api_list_documents(store: str = ""):
+    """指定(缺省=当前)向量库的已入库文档列表:文件名/格式/大小/分片数。"""
+    vec = _get_vector(store)
+    return {"documents": vec.list_documents(), "store": vec.collection_name}
 
 
 @app.get("/api/documents/preview/{file_name:path}")
-def api_preview_document(file_name: str):
+def api_preview_document(file_name: str, store: str = ""):
     """文档预览:按文件名定位原始文件,解析并返回开头文本。"""
-    vec = _get_vector()
+    vec = _get_vector(store)
     target = None
     for d in vec.list_documents():
         if d["file_name"] == file_name:
@@ -799,9 +953,9 @@ def api_preview_document(file_name: str):
 
 
 @app.get("/api/documents/chunks/{file_name:path}")
-def api_document_chunks(file_name: str):
+def api_document_chunks(file_name: str, store: str = ""):
     """按分片预览:返回该文档在向量库中的全部分片(含页码/章节)。"""
-    vec = _get_vector()
+    vec = _get_vector(store)
     exists = any(d["file_name"] == file_name for d in vec.list_documents())
     if not exists:
         raise HTTPException(404, "文档不存在")
@@ -810,9 +964,9 @@ def api_document_chunks(file_name: str):
 
 
 @app.delete("/api/documents/{file_name:path}")
-def api_delete_document(file_name: str):
+def api_delete_document(file_name: str, store: str = ""):
     """按文档名从向量库删除(连同其 md5 记录)。"""
-    if not _get_vector().del_document(file_name):
+    if not _get_vector(store).del_document(file_name):
         raise HTTPException(404, "文档不存在")
     return {"ok": True}
 

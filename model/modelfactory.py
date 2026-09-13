@@ -19,6 +19,30 @@ def dashscope_api_key() -> str:
     from utils.settings_store import get_dashscope_key
     return get_dashscope_key()
 
+
+def _report_usage(kind: str, resp) -> None:
+    """把 embedding/rerank 的 token 消耗上报给中间的用量累加器。
+
+    resp 是 openai 响应对象(有 .usage)或 DashScope 原生返回的 dict(含 usage)。
+    仅当当前处于工具调用期间才真正累加(见 agent_middleware.usage_add),
+    因此文档入库、调试检索等场景自动是空操作。
+    这里延迟 import:modelfactory 被 middleware 间接引用,顶层 import 会成环。
+    """
+    try:
+        from ReAct.middleware.agent_middleware import usage_add
+        if isinstance(resp, dict):
+            usage = resp.get("usage") or {}
+        else:
+            usage = getattr(resp, "usage", None)
+            if usage is None:
+                return
+            usage = usage if isinstance(usage, dict) else usage.model_dump()
+        tokens = int(usage.get("prompt_tokens") or usage.get("total_tokens") or 0)
+        if tokens:
+            usage_add(kind, tokens)
+    except Exception:
+        pass
+
 class BaseModelService(ABC):
     """模型服务的基类"""
     @abstractmethod
@@ -90,6 +114,7 @@ class EmbeddingModelService(BaseModelService):
                 input=batch,
                 dimensions=self._dimensions,
             )
+            _report_usage("embedding", response)
             vectors.extend(item.embedding for item in response.data)
         return vectors
 
@@ -100,6 +125,7 @@ class EmbeddingModelService(BaseModelService):
             input=text,
             dimensions=self._dimensions,
         )
+        _report_usage("embedding", response)
         return response.data[0].embedding
 
 class RerankModelService(BaseModelService):
@@ -130,6 +156,7 @@ class RerankModelService(BaseModelService):
         })
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read())
+        _report_usage("rerank", data)
         results = data["output"]["results"]
         return [(r["index"], r["relevance_score"]) for r in results]
 
@@ -140,6 +167,19 @@ def get_default_chat_model(temperature: float | None = None):
     """按 model.yml 默认模型名构建聊天模型(读当前生效 key)。无 key 时抛错由上层处理。"""
     name = (model_conf.get("model") or "").split(":", 1)[-1] or ""
     return get_chat_model(name or "qwen3.8-flash", temperature=temperature)
+
+
+def get_summary_chat_model():
+    """构建上下文压缩(摘要)专用模型:读 model.yml 的 summary_model。
+
+    与对话模型分开:摘要不需要同档能力,用小模型更快更省。
+    temperature=0 让摘要稳定可复现;max_tokens 封顶限制单次压缩成本。
+    注意 qwen3.7-flash 是思维链模型,该上限把推理 token 也算在内,故不可设得过小。
+    """
+    name = (model_conf.get("summary_model") or "").split(":", 1)[-1] or ""
+    max_tokens = int(model_conf.get("summary_max_tokens", 4000) or 4000)
+    m = get_chat_model(name or "qwen3.7-flash", temperature=0)
+    return m.bind(max_tokens=max_tokens)
 
 
 emb_model = EmbeddingModelService()

@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>元知万象 · 智能知识助手</title>
-<link rel="stylesheet" href="/static/css/style.css?v=39">
+<link rel="stylesheet" href="/static/css/style.css?v=45">
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
 </head>
@@ -106,6 +106,16 @@
           </button>
         </div>
       </div>
+
+      <!-- 知识库子栏:向量库列表(切到「知识库」时自动显示) -->
+      <div id="sidebar-stores" class="hidden">
+        <div class="store-head">
+          <span class="sidebar-config-title">向量库</span>
+          <button id="btn-new-store" class="icon-btn" title="新建向量库"><svg class="ic ic-sm"><use href="#i-plus"/></svg></button>
+        </div>
+        <div id="store-list"></div>
+        <p class="store-hint muted">点选切换当前库,agent 检索查该库</p>
+      </div>
     </aside>
 
     <!-- 右侧内容区 -->
@@ -121,6 +131,15 @@
             </div>
           </div>
           <div id="chat-input-wrap">
+            <button id="btn-scroll-bottom" class="scroll-bottom-btn hidden" title="回到最新">
+              <svg class="ic"><use href="#i-chevron-down"/></svg>
+            </button>
+            <div id="ctx-meter-wrap" class="hidden">
+              <div id="ctx-meter" class="ctx-meter">
+                <div id="ctx-meter-fill" class="ctx-fill"></div>
+              </div>
+              <span id="ctx-meter-text" class="ctx-text">0 / 200k</span>
+            </div>
             <div id="chat-docs-preview"></div>
             <div id="chat-images-preview"></div>
             <div id="chat-input-box" class="edge-lit">
@@ -150,30 +169,32 @@
         </div>
       </section>
 
-      <!-- ===== 知识库页(文档管理) ===== -->
+      <!-- ===== 知识库页(文档管理;向量库列表在左侧主导航栏) ===== -->
       <section class="view" id="view-docs">
-        <div class="page-head">
-          <h2>知识库</h2>
-          <div class="upload-wrap">
-            <button id="btn-upload" class="btn-liquid"><svg class="ic"><use href="#i-upload"/></svg> 上传文档</button>
-            <input type="file" id="doc-file-input" hidden
-                   accept=".pdf,.docx,.doc,.txt,.md,.markdown,.csv,.xlsx,.xls">
+        <div class="docs-main">
+          <div class="page-head">
+            <h2 id="docs-title">知识库</h2>
+            <div class="upload-wrap">
+              <button id="btn-upload" class="btn-liquid"><svg class="ic"><use href="#i-upload"/></svg> 上传文档</button>
+              <input type="file" id="doc-file-input" hidden
+                     accept=".pdf,.docx,.doc,.txt,.md,.markdown,.csv,.xlsx,.xls">
+            </div>
           </div>
-        </div>
-        <p id="upload-status" class="muted"></p>
-        <div class="doc-toolbar">
-          <div class="doc-filters" id="doc-filters"></div>
-          <div class="doc-search">
-            <svg class="ic ic-sm"><use href="#i-search"/></svg>
-            <input type="text" id="doc-search-input" placeholder="搜索文件名…">
+          <p id="upload-status" class="muted"></p>
+          <div class="doc-toolbar">
+            <div class="doc-filters" id="doc-filters"></div>
+            <div class="doc-search">
+              <svg class="ic ic-sm"><use href="#i-search"/></svg>
+              <input type="text" id="doc-search-input" placeholder="搜索文件名…">
+            </div>
           </div>
+          <table id="docs-table">
+            <thead>
+              <tr><th>文件名</th><th>格式</th><th>大小</th><th>分片数</th><th>操作</th></tr>
+            </thead>
+            <tbody id="docs-tbody"></tbody>
+          </table>
         </div>
-        <table id="docs-table">
-          <thead>
-            <tr><th>文件名</th><th>格式</th><th>大小</th><th>分片数</th><th>操作</th></tr>
-          </thead>
-          <tbody id="docs-tbody"></tbody>
-        </table>
       </section>
 
       <!-- ===== 检索调试页 ===== -->
@@ -435,13 +456,13 @@
   </div>
 </div>
 
-<script src="/static/js/api.js?v=4"></script>
-<script src="/static/js/app.js?v=8"></script>
+<script src="/static/js/api.js?v=6"></script>
+<script src="/static/js/app.js?v=10"></script>
 <script src="/static/js/sessions.js?v=5"></script>
-<script src="/static/js/chat.js?v=27"></script>
-<script src="/static/js/docs.js?v=7"></script>
+<script src="/static/js/chat.js?v=33"></script>
+<script src="/static/js/docs.js?v=10"></script>
 <script src="/static/js/debug.js?v=4"></script>
 <script src="/static/js/report.js?v=3"></script>
-<script src="/static/js/config.js?v=10"></script>
+<script src="/static/js/config.js?v=11"></script>
 </body>
 </html>

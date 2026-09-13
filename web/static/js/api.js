@@ -63,10 +63,10 @@ const API = {
 /**
  * SSE 流式读取(POST + fetch ReadableStream)。
  * 解析 `data: {json}\n\n` 事件,通过回调分发五类事件:
- *   onToken(str) / onTrace(obj) / onSources(arr) / onDone() / onError(msg)
+ *   onToken(str) / onTrace(obj) / onSources(arr) / onCtx(obj) / onDone() / onError(msg)
  * 返回 Promise<{aborted: boolean}>;调用方持 handle.abort() 可中断。
  */
-function sseRequest({ url, body, onToken, onTrace, onSources, onDone, onError }) {
+function sseRequest({ url, body, onToken, onTrace, onSources, onCtx, onDone, onError }) {
   const ctrl = new AbortController();
   const run = (async () => {
     let resp;
@@ -132,6 +132,7 @@ function sseRequest({ url, body, onToken, onTrace, onSources, onDone, onError })
       else if (p.token) onToken && onToken(p.token);
       else if (p.trace) onTrace && onTrace(p.trace);
       else if (p.sources) onSources && onSources(p.sources);
+      else if (p.ctx) onCtx && onCtx(p.ctx);
     }
   })();
 

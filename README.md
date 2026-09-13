@@ -64,6 +64,7 @@
 ### 1. 前置
 
 - Python 3.13+、uv；Docker（跑 Milvus）。
+- Node.js 20+（构建前端用；前端是 Vue 3 + Vite，产物由 FastAPI 托管）。
 - 注册 [DashScope](https://dashscope.console.aliyun.com/) 获取 API Key，并开通 `qwen3.8-flash`、`qwen3.7-text-embedding-flash`、`qwen3.7-text-rerank`、`qwen-vl-plus` 模型。
 
 ### 2. 环境变量
@@ -100,10 +101,30 @@ docker run -d --name rag-mysql -e MYSQL_ROOT_PASSWORD=xxx -p 3306:3306 mysql:8
 
 ```bash
 uv sync                          # 按 pyproject.toml / uv.lock 安装
-uv run python web/server.py      # 启动 FastAPI(默认 127.0.0.1:8001)
+```
+
+然后一键启动（推荐）：
+
+```bash
+start.bat                        # Windows
+# 或跨平台: python start.py
+```
+
+它会先构建前端再启动后端，构建失败则拒绝启动（避免发出旧页面）。等价于手动两步：
+
+```bash
+cd frontend && npm run build     # 构建前端 → 产物落到 web/static/
+cd .. && uv run python web/server.py   # 启动 FastAPI(默认 127.0.0.1:8001)
 ```
 
 浏览器打开 `http://127.0.0.1:8001` 即可进入「会话」页提问，首次提问会自动初始化数据库。
+
+> **前端改了没生效?** 前端源码在 `frontend/`，由 Vite 构建到 `web/static/` 后交给 FastAPI
+> 当静态文件托管，**8001 不参与构建**。改了 `frontend/src/` 必须重新 `npm run build`
+> （或直接用 `start.bat`）。改动后端 `.py` 则需重启服务。
+>
+> 开发时想改完即时生效，可另起 Vite dev server：`cd frontend && npm run dev`
+> （3000 端口，接口自动代理到 8001，存盘即刷新）。日常使用不需要它。
 
 ### 5.（可选）导入知识库文档
 

@@ -157,6 +157,12 @@ function msgDocs(m) {
                 <span class="msg-head-name">知识库助手</span>
               </div>
               <div class="msg-bubble md-body" v-html="m.renderedHtml"></div>
+              <!-- 生成中动态徽标:气泡之后(整块替换的只有气泡,这个不动 → spinner 不被打断) -->
+              <span v-if="m.liveVisible" class="ls-badge">
+                <span class="ls-spinner"></span>
+                <span class="ls-text">{{ m.liveText }}</span>
+                <span class="ls-time">{{ m.liveSecs }}s</span>
+              </span>
             </div>
             <div v-if="m.content" class="msg-actions">
               <button class="act-copy" title="复制" @click="copyText(m.content)">

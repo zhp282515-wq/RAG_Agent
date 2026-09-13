@@ -1,4 +1,4 @@
-import { computed, ref } from "vue";
+import { computed, reactive, ref } from "vue";
 import { API, sseRequest } from "../api";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
@@ -250,20 +250,27 @@ export async function send(query, images = [], docs = []) {
     docs: docs.map((d) => ({ name: d.name })),
   });
 
-  const asst = {
+  const asst = reactive({
     role: "assistant",
     content: "",
     sources: [],
     images: [],
     workflow: [],
     renderedHtml: "",
-  };
+    /** 生成中徽标文案(如"模型思考中"/"解答中"),空则隐藏 */
+    liveText: "",
+    /** 徽标计时(秒) */
+    liveSecs: 0,
+    liveVisible: false,
+  });
   // 记住本轮请求(重新生成时精确复用,而非依赖全局 lastUserQuery)
   asst._req = {
     query: text,
     images: images.map((i) => ({ name: i.name, path: i.path })),
     docs: docs.map((d) => ({ name: d.name, path: d.path })),
   };
+  // 先 push 代理对象再改,后续回调都走代理 → 触发重渲染。
+  // (直接改原始对象会绕过 Vue 响应式,DOM 不更新 —— 曾导致流式内容整块才出现)
   messages.value.push(asst);
   scrollBottom();
 
@@ -275,6 +282,40 @@ export async function send(query, images = [], docs = []) {
   clearPendingImages();
   clearPendingDocs();
   startWorkflow();
+
+  // ---- 生成中动态徽标(内联于回答卡片内,气泡之后:当前动作 + 总计时) ----
+  // 思维链模型会先静默推理数秒,期间没有任何 token;靠这个徽标告诉用户"在做什么",
+  // 否则界面看起来像卡死了。100ms 刷新计时,spinner 与计时分离避免动画被打断。
+  let liveTimer = null;
+  const liveStart = performance.now();
+  const renderLive = () => {
+    asst.liveSecs = ((performance.now() - liveStart) / 1000).toFixed(1);
+  };
+  const startLive = () => {
+    asst.liveVisible = true;
+    asst.liveText = "准备中…";
+    renderLive();
+    liveTimer = setInterval(renderLive, 100);
+  };
+  const stopLive = () => {
+    if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
+    asst.liveVisible = false;
+  };
+  /** trace 事件到达 → 更新"当前在做什么"文案 */
+  const onLiveEvent = (tr) => {
+    const act = tr.action;
+    const step = tr.step || "";
+    if (act === "phase_start") {
+      if (step === "模型") asst.liveText = "模型思考中";
+      else if (tr.name && tr.name !== step) asst.liveText = tr.name;
+      else asst.liveText = step;
+    } else if (act === "substep") {
+      asst.liveText = tr.name || asst.liveText;
+    } else if (act === "phase_end") {
+      asst.liveText = "处理中…";
+    }
+  };
+  startLive();
 
   const modelName = currentModel.value;
 
@@ -337,11 +378,13 @@ export async function send(query, images = [], docs = []) {
     },
     onToken: (t) => {
       asst.content += t;
+      asst.liveText = "解答中"; // 模型开始吐字 → 切"解答中"
       kick();
     },
     onTrace: (tr) => {
       asst.workflow.push(tr);
       addWorkflowStep();
+      onLiveEvent(tr);
     },
     onCtx: (c) => {
       updateContext(c);
@@ -368,6 +411,7 @@ export async function send(query, images = [], docs = []) {
     clearTimeout(tickTimer);
     tickTimer = null;
   }
+  stopLive(); // 生成结束,移除动态徽标
   // 收尾:确保最终内容以完整 markdown 呈现
   asst.renderedHtml = mdToHtml(asst.content);
   sending.value = false;

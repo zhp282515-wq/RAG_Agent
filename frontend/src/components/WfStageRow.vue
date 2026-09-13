@@ -9,6 +9,8 @@ const props = defineProps({
   stage: { type: Object, required: true },
   /** 实时计时基准:进行中阶段的耗时 = now - realT0。面板传响应式的 now,静态场景可不传 */
   now: { type: Number, default: 0 },
+  /** 是否"当前正在执行的那一步"(最后一个未完成的阶段):额外加脉冲高亮,便于一眼定位 */
+  current: { type: Boolean, default: false },
 });
 
 function durLabel(s) {
@@ -24,7 +26,7 @@ function toolTag(s) {
 </script>
 
 <template>
-  <div class="wf-step" :class="stage.state">
+  <div class="wf-step" :class="[stage.state, { 'is-current': current }]">
     <span class="wf-step-icon">
       <span v-if="stage.state === 'running'" class="wf-spinner"></span>
       <span v-else class="wf-done-ic"><svg class="ic ic-xs"><use href="#i-check" /></svg></span>

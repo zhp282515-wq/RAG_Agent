@@ -1,4 +1,4 @@
-import { computed, reactive, ref } from "vue";
+import { computed, nextTick, reactive, ref } from "vue";
 import { API, sseRequest } from "../api";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
@@ -33,8 +33,15 @@ export const sending = computed(() => inFlight.has(currentId.value));
 
 /** 每个会话的消息数组:切走时存下、切回时恢复(含正在生成的那轮) */
 const messageCache = new Map();
-/** 正在生成的会话 → 它那轮的 assistant 消息对象(工作流面板按会话取用) */
-const liveAsst = new Map();
+
+/**
+ * 正在生成的会话 → 它那轮的 assistant 消息对象(工作流面板按会话取用)。
+ * **必须是 reactive 的集合**:面板的计算属性会读 liveAsst.get(id).workflow,
+ * 普通 Map 的 get 不建立依赖,后续 push 事件不会让它重新求值 ——
+ * 结果就是工作流面板在整轮生成期间一直卡在上一条回答的阶段,直到收尾才刷新。
+ * (Vue 3 对 Map/Set 有响应式支持:get 会追踪、set 会触发。)
+ */
+const liveAsst = reactive(new Map());
 
 export const pendingImages = ref([]); // [{name, path}]
 export const pendingDocs = ref([]);   // [{name, path}]
@@ -68,6 +75,14 @@ export function mdToHtml(md) {
 
 /* ---------------- 滚动 ---------------- */
 
+/** 由 initScrollFollow 注入:声明"接下来这段时间的 scroll 事件是程序滚动造成的" */
+let programmaticScrollUntil = () => {};
+
+/** 程序把容器滚到底(抑制声明由调用方决定窗口长度) */
+function scrollBoxToBottom() {
+  if (messagesEl) messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
 /**
  * 仅在"贴着底部看"时自动跟随。用户上滑翻阅历史时不再把他拽回底部
  * (流式输出每 ~60ms 就会调到这里,无条件拉底会让人根本没法往回看)。
@@ -78,10 +93,52 @@ export function scrollBottom() {
 }
 
 /**
+ * 强制滚到底部,无视当前跟随状态。
+ * 用于"用户主动表达想看最新内容"的时机(发送消息、切换会话) ——
+ * 这些场景下拉底是符合预期的,而流式输出过程中不能这么做。
+ */
+export function forceScrollBottom() {
+  programmaticScrollUntil(400);
+  scrollBoxToBottom();
+  stick.value = true;
+  showJumpBtn.value = false;
+}
+
+/**
+ * 等 DOM 更新完成后再滚到底。
+ * 必须 nextTick:改完 messages 就立刻读 scrollHeight 拿到的是**旧**值
+ * (Vue 还没渲染出新内容),会让切换会话后停在顶部。
+ *
+ * 还要补几次延迟重试:markdown 里的表格/图片/字体是**异步**撑高容器的,
+ * 只滚一次会差几十像素(实测切会话后差 77px)。重试都带 stick 守卫 ——
+ * 用户若在这期间主动上滑,stick 会变 false,重试即跳过,不会把人拽回底部。
+ */
+export async function scrollBottomAfterRender() {
+  await nextTick();
+  // 三次重试要跨 400ms,单次 programmaticScrollUntil 的抑制窗口不够宽,
+  // 这里一次性声明覆盖整段(期间收到的 scroll 事件都算程序造成的)
+  programmaticScrollUntil(700);
+  scrollBoxToBottom();
+  stick.value = true;
+  showJumpBtn.value = false;
+  for (const delay of [60, 180, 400]) {
+    setTimeout(() => {
+      if (!stick.value) return; // 用户已接管,别抢
+      scrollBoxToBottom();
+    }, delay);
+  }
+}
+
+/**
  * 绑定滚动监听:记录用户是否处于"贴底"状态。
  * 不能只看 scroll 事件 —— 流式 markdown 每次重绘都会整块替换 innerHTML,
  * scrollHeight 突变也会触发 scroll,会被误判成"用户滑上去了" → 跟随静默失效。
  * 故只用真实的用户操作(滚轮/触摸/拖滚动条)断开跟随;回到贴底则永远恢复。
+ *
+ * 另外:程序自己滚动(滚到底/渲染后补偿)也会触发 scroll 事件。如果不加区分,
+ * 浏览器把 scrollTop 钳到 scrollHeight 会触发一次 **异步** scroll,极容易赶在
+ * userScrolling 的 250ms 窗口内,于是被当成"用户上滑",跟随就此失效。
+ * 故设一个 suppress 窗口,程序滚动期间收到的事件一律不改变跟随状态。
  */
 export function initScrollFollow() {
   const box = messagesEl;
@@ -89,21 +146,28 @@ export function initScrollFollow() {
   const GAP = 40; // 容差(px),避免像素级抖动误判
   let userScrolling = false;
   let idleTimer = null;
+  let suppressUntil = 0; // 程序滚动期间忽略 scroll 事件的时间戳上限
   const gap = () => box.scrollHeight - box.scrollTop - box.clientHeight;
 
   const markUser = () => {
+    // 程序滚动会持续几十毫秒(容器滚动是平滑的),期间的真实输入事件忽略掉
+    if (Date.now() < suppressUntil) return;
     userScrolling = true;
     clearTimeout(idleTimer);
     idleTimer = setTimeout(() => { userScrolling = false; }, 250);
   };
 
   const sync = () => {
+    if (Date.now() < suppressUntil) return; // 程序滚动引起的事件:不改变意图
     const g = gap();
     if (g <= GAP) stick.value = true;        // 贴底 → 总是恢复跟随
     else if (userScrolling) stick.value = false; // 仅用户主动上滑才断开
     // 自愈:几何上已贴底就把跟随复位,避免边界时序留下 stick=false 残状态
     showJumpBtn.value = !stick.value;
   };
+
+  // 供程序滚动调用:声明"接下来这段时间的 scroll 事件是我造成的"
+  programmaticScrollUntil = (ms = 300) => { suppressUntil = Date.now() + ms; };
 
   box.addEventListener("scroll", sync, { passive: true });
   box.addEventListener("wheel", markUser, { passive: true });
@@ -126,9 +190,7 @@ export function destroyScrollFollow() {
 
 /** 点按钮:跳回底部并恢复跟随 */
 export function jumpToBottom() {
-  stick.value = true;
-  showJumpBtn.value = false;
-  if (messagesEl) messagesEl.scrollTop = messagesEl.scrollHeight;
+  forceScrollBottom();
 }
 
 /* ---------------- 渲染 ---------------- */
@@ -162,6 +224,8 @@ export function showSessionLoading() {
   }
   stick.value = true;
   showJumpBtn.value = false;
+  // 切会话默认看最新内容 → 等渲染完再滚到底(否则停在顶部)
+  scrollBottomAfterRender();
 }
 
 /** 用服务端历史重建消息列表(含把前一条 user 配对成 assistant 的 _req) */
@@ -232,9 +296,10 @@ export function renderHistory(msgs) {
   messages.value = out;
   if (sessId) messageCache.set(sessId, out);
   seedContext(lastCtx); // 进度条以最近一条 assistant 的 context 为准
-  stick.value = true;   // 打开会话默认看最新内容 → 重置为贴底跟随
+  // 打开会话默认看最新内容 → 重置为贴底跟随,并等渲染完滚到底
+  stick.value = true;
   showJumpBtn.value = false;
-  scrollBottom();
+  scrollBottomAfterRender();
 }
 
 /** 重新生成:用该条回答自己的 _req 提问(而非全局 lastUserQuery) */
@@ -313,6 +378,9 @@ export async function send(query, images = [], docs = []) {
     images: images.map((i) => i.path),
     docs: docs.map((d) => ({ name: d.name })),
   });
+  // 用户主动发消息 → 贴底跟随,并等用户消息渲染完滚到底
+  // (明确表达"我要看这一轮",所以强制滚,而非只在贴底时跟随)
+  scrollBottomAfterRender();
 
   const asst = reactive({
     role: "assistant",

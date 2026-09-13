@@ -118,13 +118,11 @@ export function buildStages(events, now = Date.now()) {
       });
     }
   }
-  // 流式结束仍 running 的补为完成、无耗时(不该出现,防御)
-  for (const s of stages) {
-    if (s.state === "running") {
-      s.state = "done";
-      s.dur = null;
-    }
-  }
+  // 注意:这里**不能**把仍处于 running 的阶段强制改成 done。
+  // 实时渲染时,最后一条事件往往是 phase_start(如"模型思考中"),
+  // 它的 phase_end 还没到 —— 这正是"当前正在执行的那一步"。
+  // 若在此抹平,面板就永远看不到进行中状态(spinner 不转、"执行完成"提前出现)。
+  // 遗留的未闭合阶段交给调用方处理:面板据此显示进行中,弹窗据此不显示汇总行。
 
   // 给"模型"阶段按位置定语义:
   //   开头/检索前 → 理解问题并规划检索;检索后(且非最后) → 评估结果决定下一步;

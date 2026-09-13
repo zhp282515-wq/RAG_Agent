@@ -19,7 +19,9 @@ function close() {
 defineExpose({ open: show, close });
 
 const stages = computed(() => buildStages(events.value));
-const total = computed(() => totalRow(events.value, usage.value));
+const hasRunning = computed(() => stages.value.some((s) => s.state === "running"));
+/** 弹窗展示的是已结束的历史回答,有 running 阶段说明记录不完整,此时不显示汇总行 */
+const total = computed(() => (hasRunning.value ? null : totalRow(events.value, usage.value)));
 </script>
 
 <template>

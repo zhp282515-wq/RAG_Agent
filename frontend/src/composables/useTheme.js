@@ -12,10 +12,13 @@ const LS = {
   collapsed: "sidebar-collapsed",
   wallpaper: "wallpaper",
   blur: "glass-blur",
+  wallBlur: "wall-blur",
 };
 
-/** 模糊度默认值(原生版 App.DEFAULT_BLUR) */
+/** 玻璃面板模糊度默认值(原生版 App.DEFAULT_BLUR) */
 export const DEFAULT_BLUR = 20;
+/** 壁纸层模糊度默认值 */
+export const DEFAULT_WALL_BLUR = 24;
 
 /** 深色模式:<body> 上的 .dark 类(非 media query) */
 export const isDark = ref(localStorage.getItem(LS.theme) === "dark");
@@ -26,8 +29,24 @@ export const sidebarCollapsed = ref(localStorage.getItem(LS.collapsed) === "1");
 /** 自定义壁纸(data URL);null = 用内置摄影底 */
 export const wallpaper = ref(localStorage.getItem(LS.wallpaper) || null);
 
-/** 毛玻璃模糊度 0~40 */
-export const blur = ref(DEFAULT_BLUR);
+/** 模糊度通用的取值/夹取工具(定义在 ref 之前,避免 TDZ) */
+const clampBlur = (v) => Math.max(0, Math.min(40, Number(v) || 0));
+const readBlur = (key, fallback) => {
+  const raw = localStorage.getItem(key);
+  return raw === null ? fallback : clampBlur(raw);
+};
+
+/**
+ * 模糊度 0~40。
+ * **初始值必须直接读 localStorage**,与 theme / sidebar-collapsed / wallpaper 保持一致:
+ * 若初始值给默认值、再靠 `watch(..., {immediate:true})` 回写,那个 immediate 会在
+ * **模块加载瞬间**用默认值覆盖掉用户已保存的设置,之后读到的已是脏数据 ——
+ * 表现为"每次刷新都回到默认"。
+ */
+/** 玻璃面板模糊度(外观设置 → 界面模糊度) */
+export const blur = ref(readBlur(LS.blur, DEFAULT_BLUR));
+/** 壁纸层模糊度(外观设置 → 背景模糊度)。与 blur 完全独立。 */
+export const wallBlur = ref(readBlur(LS.wallBlur, DEFAULT_WALL_BLUR));
 
 /** 当前视图 / 侧栏模式 */
 export const currentView = ref("chat");
@@ -99,33 +118,42 @@ export function wallpaperStyle() {
     : {};
 }
 
-// ---- 模糊度:写到 <html> 的 CSS 变量上 ----
-function applyBlur(v) {
+// ---- 模糊度:两套互相独立,各写各的 CSS 变量 ----
+/** 玻璃面板虚化(外观设置 → 界面模糊度) */
+function applyGlassBlur(v) {
   document.documentElement.style.setProperty("--glass-blur", String(v));
-  // 背景层模糊单独跟随(原生版:bg-blur-px = round(v * 1.7))
-  document.documentElement.style.setProperty("--bg-blur-px", String(Math.round(v * 1.7)));
+}
+/** 壁纸层虚化(外观设置 → 背景模糊度) */
+function applyWallBlur(v) {
+  document.documentElement.style.setProperty("--wall-blur", String(v));
 }
 
 watch(
   blur,
   (v) => {
-    applyBlur(v);
+    applyGlassBlur(v);
     localStorage.setItem(LS.blur, String(v));
   },
   { immediate: true },
 );
 
-/** 设置模糊度(自动 clamp 到 0~40,与原生版一致) */
+watch(
+  wallBlur,
+  (v) => {
+    applyWallBlur(v);
+    localStorage.setItem(LS.wallBlur, String(v));
+  },
+  { immediate: true },
+);
+
+/** 设置玻璃模糊度(clamp 到 0~40) */
 export function setBlur(val) {
-  blur.value = Math.max(0, Math.min(40, Number(val) || 0));
+  blur.value = clampBlur(val);
 }
 
-/** 首屏初始化:读 localStorage,无值时用默认值(且不覆盖持久化) */
-export function initBlur() {
-  const saved = localStorage.getItem(LS.blur);
-  const v = saved !== null ? Number(saved) : DEFAULT_BLUR;
-  blur.value = Math.max(0, Math.min(40, Number(v) || 0));
-  applyBlur(blur.value);
+/** 设置壁纸模糊度(clamp 到 0~40) */
+export function setWallBlur(val) {
+  wallBlur.value = clampBlur(val);
 }
 
 // ---- 外观设置弹窗 ----

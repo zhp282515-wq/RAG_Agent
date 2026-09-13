@@ -13,13 +13,14 @@ import {
   isDark,
   sidebarCollapsed,
   blur,
+  wallBlur,
   currentView,
   sidebarMode,
   toggleTheme,
   toggleSidebar,
   setBlur,
+  setWallBlur,
   wallpaperStyle,
-  initBlur,
   settingsOpen,
   closeSettings,
   openAppearance,
@@ -73,7 +74,8 @@ function onResetWallpaper() {
 }
 
 onMounted(() => {
-  initBlur();
+  // 模糊度不在这里初始化:ref 的初始值就读 localStorage,watcher 会把它们同步到
+  // CSS 变量上(模块加载时即完成),无需再手动跑一遍。
   initModelPicker();     // 当前对话模型(徽标 + localStorage 同步)
   refreshSessions();     // 侧栏会话列表首屏加载(原生版 DOMContentLoaded 里也做)
   // 点击空白处关闭头像菜单(原生版挂在 document 上)
@@ -159,7 +161,16 @@ onMounted(() => {
         </div>
         <input type="range" id="glass-blur-slider" min="0" max="40" step="1" :value="blur"
                class="slider-full" @input="setBlur($event.target.value)">
-        <p class="setting-hint">控制玻璃面板与背景的模糊强度,0 为完全清晰。</p>
+        <p class="setting-hint">玻璃面板的虚化强度(面板背后内容的模糊程度),0 为完全清晰。与壁纸模糊互相独立。</p>
+
+        <div class="setting-row">
+          <span class="setting-label">背景模糊度</span>
+          <span class="setting-value" id="wall-blur-val">{{ wallBlur }}</span>
+        </div>
+        <input type="range" id="wall-blur-slider" min="0" max="40" step="1" :value="wallBlur"
+               class="slider-full" @input="setWallBlur($event.target.value)">
+        <p class="setting-hint">壁纸本身的虚化强度,只影响背景层,不改变玻璃面板的清晰度。</p>
+
         <div class="appearance-divider"></div>
         <div class="setting-row"><span class="setting-label">背景壁纸</span></div>
         <div class="wallpaper-actions">

@@ -18,25 +18,34 @@
   --accent-deep: #2F5FD9;
   --text-main: #172033;
   --text-muted: #334155;
-  --text-faint: #64748B;
+  /* 三级文字(占位符/次要说明,13px 小字)。玻璃层调薄后透出的壁纸更亮,
+     原来的 #64748B 在亮壁纸上只有 ~3.3:1、达不到正文 4.5:1,
+     故加深到 #4D5765(实测三种亮背景下最差 5.01:1)。 */
+  --text-faint: #4D5765;
 
-  /* ---- 三层液态玻璃:底色用低饱和冷灰蓝(实而不惨白),不用纯白蒙层 ---- */
-  --glass-l1: rgba(226, 232, 244, 0.2);   /* 顶栏(较实,偏冷白而非纯白) */
-  --glass-l2: rgba(226, 232, 244, 0.2);   /* 侧边栏/主区(半实,冷调覆盖壁纸) */
-  --glass-l3: rgba(226, 232, 244, 0.2);   /* 消息卡片/输入框 */
-  --glass-chip: rgba(226, 232, 244, 0.45);
-  --glass-border: rgba(255, 255, 255, 0.38);
-  --glass-highlight-top: rgba(255, 255, 255, 1);
-  --glass-highlight-side: rgba(255, 255, 255, 0.5);
-  --glass-highlight-bottom: rgba(255, 255, 255, 0.2);
-  --glass-inner-glow: inset 0 1px 0 rgba(255, 255, 255, 0.55);
+  /* ---- 三层液态玻璃 ----
+     底色:中性冷灰蓝、**低不透明度**。玻璃面板靠 backdrop-filter 虚化背后的内容
+     来形成材质感,面板自身只需极薄一层染色,不能拿高不透明度的白去盖背景
+     (那会变成"白蒙蒙一块",既丢了背后的色彩轮廓,也和壁纸层糊在一起)。 */
+  --glass-l1: rgba(233, 237, 246, 0.13);   /* 顶栏 */
+  --glass-l2: rgba(233, 237, 246, 0.13);   /* 侧边栏/主区 */
+  --glass-l3: rgba(233, 237, 246, 0.15);   /* 消息卡片/输入框 */
+  --glass-chip: rgba(233, 237, 246, 0.30);
+  --glass-border: rgba(255, 255, 255, 0.30);
+  --glass-highlight-top: rgba(255, 255, 255, 0.9);
+  --glass-highlight-side: rgba(255, 255, 255, 0.4);
+  --glass-highlight-bottom: rgba(255, 255, 255, 0.15);
+  --glass-inner-glow: inset 0 1px 0 rgba(255, 255, 255, 0.45);
   --glass-shadow: 0 12px 40px rgba(20, 40, 70, 0.10);
   --glass-shadow-soft: 0 8px 28px rgba(20, 40, 70, 0.08);
 
-  /* 模糊度数字(px):--blur 基于它;滑块调节此变量并持久化 */
-  --glass-blur: 32;
-  --bg-blur-px: 24;
-  --blur: blur(calc(var(--glass-blur) * 1px)) saturate(160%);
+  /* ---- 两个模糊度互相独立 ----
+     --glass-blur:玻璃面板的虚化强度(外观设置里的「界面模糊度」)
+     --wall-blur: 壁纸层的虚化强度(外观设置里的「背景模糊度」)
+     分别由各自的滑块写入,改一个不影响另一个。 */
+  --glass-blur: 20;
+  --wall-blur: 24;
+  --blur: blur(calc(var(--glass-blur) * 1px)) saturate(140%);
   --radius-lg: 20px;
   --radius-md: 14px;
   --ease: 300ms ease-out;
@@ -46,15 +55,16 @@ body.dark {
   --text-main: #F5F7FA;
   --text-muted: #B9C3D4;
   --text-faint: #7C8AA3;
-  --glass-l1: rgba(24, 32, 56, 0.7);
-  --glass-l2: rgba(24, 32, 56, 0.58);
-  --glass-l3: rgba(24, 32, 56, 0.60);
-  --glass-chip: rgba(24, 32, 56, 0.52);
-  --glass-border: rgba(255, 255, 255, 0.16);
-  --glass-highlight-top: rgba(255, 255, 255, 0.22);
-  --glass-highlight-side: rgba(255, 255, 255, 0.10);
-  --glass-highlight-bottom: rgba(255, 255, 255, 0.05);
-  --glass-inner-glow: inset 0 1px 0 rgba(255, 255, 255, 0.14);
+  /* 深色下玻璃更暗、但同样保持低不透明度(靠模糊形成材质,不靠盖色) */
+  --glass-l1: rgba(18, 24, 42, 0.42);
+  --glass-l2: rgba(18, 24, 42, 0.30);
+  --glass-l3: rgba(18, 24, 42, 0.34);
+  --glass-chip: rgba(18, 24, 42, 0.46);
+  --glass-border: rgba(255, 255, 255, 0.14);
+  --glass-highlight-top: rgba(255, 255, 255, 0.20);
+  --glass-highlight-side: rgba(255, 255, 255, 0.09);
+  --glass-highlight-bottom: rgba(255, 255, 255, 0.04);
+  --glass-inner-glow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
   --glass-shadow: 0 12px 40px rgba(8, 12, 28, 0.45);
   --glass-shadow-soft: 0 8px 28px rgba(8, 12, 28, 0.38);
 }
@@ -87,7 +97,11 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-/* ---------- 背景:真实摄影照片,强虚化后只留光影(模糊度随滑块) ---------- */
+/* ---------- 背景:真实摄影照片,虚化后作为玻璃面板的"衬底" ----------
+   独立层叠上下文(见下方 #app 的 isolation),模糊只作用于本层,与玻璃层的
+   backdrop-filter 互不干扰。用 --wall-blur(壁纸专用,独立于 --glass-blur)。
+   刻意不加 brightness/saturate:那会把壁纸整体提亮/灰化,透过玻璃看就是
+   "发白、雾蒙蒙"。保留原始色彩与轮廓,虚化交给 blur 一层就够。 */
 #bg-blur {
   position: fixed;
   inset: -60px;
@@ -95,17 +109,19 @@ body {
   background-image: url("https://images.unsplash.com/photo-1497366216548-37526070297c?q=80&w=2400&auto=format&fit=crop");
   background-size: cover;
   background-position: center;
-  filter: blur(calc(var(--bg-blur-px, 24) * 1px)) saturate(82%) contrast(94%) brightness(1.06);
+  filter: blur(calc(var(--wall-blur, 24) * 1px));
   transform: scale(1.03);
   transition: filter 200ms ease;
+  /* 自成层叠上下文:确保本层的 filter 不会与上层 glass 的 backdrop-filter 相互影响 */
+  isolation: isolate;
 }
-/* 用户自定义壁纸:取消放大裁切与露边(模糊同样随滑块) */
+/* 用户自定义壁纸:取消放大裁切与露边 */
 #bg-blur.custom {
   transform: none;
   inset: 0;
 }
-body.dark #bg-blur { filter: blur(calc(var(--bg-blur-px, 24) * 1px)) saturate(70%) contrast(96%) brightness(0.55); }
-body.dark #bg-blur.custom { filter: blur(calc(var(--bg-blur-px, 24) * 1px)) saturate(80%) brightness(0.75); transform: none; inset: 0; }
+body.dark #bg-blur { filter: blur(calc(var(--wall-blur, 24) * 1px)) brightness(0.72); }
+body.dark #bg-blur.custom { filter: blur(calc(var(--wall-blur, 24) * 1px)) brightness(0.86); transform: none; inset: 0; }
 
 .hidden { display: none !important; }
 .muted { color: var(--text-faint); font-size: 13px; }
@@ -151,6 +167,12 @@ body.dark #bg-blur.custom { filter: blur(calc(var(--bg-blur-px, 24) * 1px)) satu
   height: 100vh;
   padding: 14px 16px;
   gap: 14px;
+  /* 与壁纸层(#bg-blur, z-index:-1)互为独立层叠上下文:
+     壁纸层的 filter 虚化、玻璃层的 backdrop-filter 各自在自己的上下文里生效,
+     不会相互"吃掉"或叠加成发白蒙层。 */
+  position: relative;
+  z-index: 1;
+  isolation: isolate;
 }
 
 /* ============ Level 1:顶部导航(最高透明度) ============ */
@@ -843,6 +865,24 @@ body.dark .wf-step-tok { color: #B9C0CE; background: rgba(150, 160, 180, 0.18); 
   animation: wf-spin 0.7s linear infinite;
 }
 @keyframes wf-spin { to { transform: rotate(360deg); } }
+/* 当前正在执行的那一步:整行轻底色 + 左侧脉冲强调条,便于在长列表里一眼定位。
+   只给最后一步(is-current)加,避免多个 running 阶段(交错工具)时满屏都在闪。 */
+.wf-step.is-current {
+  background: rgba(60, 120, 255, 0.07);
+  border-radius: 8px;
+  margin-left: -8px; margin-right: -8px;
+  padding-left: 8px; padding-right: 8px;
+  position: relative;
+}
+.wf-step.is-current::before {
+  content: "";
+  position: absolute; left: 0; top: 8px; bottom: 8px;
+  width: 2px; border-radius: 2px;
+  background: var(--accent);
+  animation: wf-pulse 1.4s ease-in-out infinite;
+}
+@keyframes wf-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+body.dark .wf-step.is-current { background: rgba(90, 150, 255, 0.12); }
 .wf-running { font-size: 11px; color: var(--text-faint); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .wf-total { border-bottom: none; margin-top: 2px; }
 .wf-total .wf-step-name { font-weight: 600; }
@@ -1013,6 +1053,7 @@ body.dark .fmt-badge { background: color-mix(in srgb, var(--fmt-c) 24%, transpar
 .upload-wrap button, .debug-form button {
   background: rgba(60, 120, 255, 0.72);
   backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
   border: 1px solid rgba(255, 255, 255, 0.45);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.55), 0 6px 16px rgba(47, 95, 217, 0.24);
   color: #fff;
@@ -1087,6 +1128,7 @@ body.dark .fmt-badge { background: color-mix(in srgb, var(--fmt-c) 24%, transpar
   position: fixed; inset: 0; z-index: 100;
   background: rgba(16, 24, 40, 0.30);
   backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
   display: flex; align-items: center; justify-content: center;
 }
 .modal-box {

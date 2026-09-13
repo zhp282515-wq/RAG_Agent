@@ -34,6 +34,15 @@ export const currentView = ref("chat");
 /** sessions(会话) / config(系统配置子栏) / stores(向量库列表) */
 export const sidebarMode = ref("sessions");
 
+/**
+ * 切换视图,并联动侧栏内容。
+ * 各页进入时的数据刷新由 App.vue 负责(避免这里反向依赖各页 composable 造成循环 import)。
+ */
+export function switchView(view) {
+  currentView.value = view;
+  sidebarMode.value = view === "config" ? "config" : view === "docs" ? "stores" : "sessions";
+}
+
 // ---- 深色模式:<body> 不在 Vue 应用根内,只能命令式写类 ----
 watch(
   isDark,

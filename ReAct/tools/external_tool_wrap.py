@@ -8,27 +8,37 @@ system_prompt 里那套「识别 @@TOOL_ERROR@@ → 按建议修正后重试一�
 
 本模块把每个外部 MCP 工具包一层 BaseTool:
     - _run(同步入口,同步 ToolNode 会调)→ asyncio.run(_arun)
-    - _arun(异步入口)→ 委托内层 _inner.ainvoke,带指数退避重试 + 异常归一
+    - _arun(异步入口)→ 委托内层 _inner.ainvoke,重试/退避/熔断交给 utils.resilience
     - 瞬时错误(超时/连接/服务端忙)自动重试;确定性错误/重试耗尽 → @@TOOL_ERROR@@ 块
     - 重试期间经 agent_tools.tool_step 上报"自动重试N"子步骤(web 工作流可见)
     - 返回值可能是 content-block 列表 → 归一为纯文本给模型
+
+重试逻辑**不再自己实现**:原先这里有一套独立的退避算式(且漏了抖动)和一份
+`_looks_retryable` 文本匹配,是「每个调用点各写一套」的典型。现在只保留 MCP 特有的
+**传输层特征词**,注册进公共分类器;退避、熔断、日志、指标全部由组件统一处理。
 """
 import asyncio
-import inspect
 
-from langchain_core.tools import BaseTool, StructuredTool
+from langchain_core.tools import BaseTool
 from pydantic import PrivateAttr
 
-from ReAct.tools.retry_util import tool_error_block, ToolRetryableError
+from ReAct.tools.retry_util import tool_error_block
 from utils.logger_tool import logger
+from utils.resilience import Kind, acall, classify, register_exception_kind
 
-# 判定为「瞬时错误」的线索(MCP 传输/连接层;应用层确定性错误多不带这些词)
+# 判定为「瞬时错误」的线索(MCP 传输/连接层;应用层确定性错误多不带这些词)。
+# 这些词注册进公共分类器后对外部工具全局生效 —— 它们本身就是传输层信号,
+# 无论哪个调用点看到都该重试。
+#
+# 刻意不含原实现里的裸 " 5"(会命中任何带 " 5" 的文本,例如「重试 5 次」)与
+# "cancelled"(CancelledError 已由驱动的 except Exception 语义自动豁免,无需在此兜)。
 _RETRYABLE_HINTS = (
-    "timeout", "timed out", "timedout", "connection", "connectionreset", "econnreset",
+    "timeout", "timed out", "timedout",
+    "connection", "connection reset", "connectionreset", "econnreset",
     "server busy", "unavailable", "temporarily", "refused", "broken pipe",
-    "remote disconnected", "read closed", "reset by peer", " 429", " 408",
-    " 5",  # 5xx
-    "transport", "disconnected", "cancelled",
+    "remote disconnected", "read closed", "reset by peer",
+    " 429", " 408",
+    "transport", "disconnected",
 )
 
 # 外部工具错误建议(面向模型/用户的中文兜底)
@@ -36,10 +46,13 @@ _GEN_SUGGESTION = "请修正参数后重试一次;若为外部服务暂时不可
 _GEN_RETRY_SUGGESTION = "该外部服务暂时不可用,已自动重试仍失败,请如实告知用户稍后再试"
 
 
-def _looks_retryable(e: BaseException) -> bool:
-    """按错误类型/文本判断是否瞬时(可重试)。"""
+def _mcp_transport_hint(e: BaseException) -> bool:
     txt = f"{type(e).__name__} {e}".lower()
     return any(k in txt for k in _RETRYABLE_HINTS)
+
+
+# 注册到公共分类器:优先级 50(比内置的 100 更靠前),让 MCP 传输特征词先被识别。
+register_exception_kind(_mcp_transport_hint, Kind.TRANSIENT, code="mcp_transport", priority=50)
 
 
 def _coerce_text(v) -> str:
@@ -106,7 +119,7 @@ class ExternalToolWrapper(BaseTool):
     def _run(self, *args, **kwargs):
         return asyncio.run(self._arun(*args, **kwargs))
 
-    # ---- 异步入口:重试 + 归一 ----
+    # ---- 异步入口:重试 + 归一(重试细节全部交给 utils.resilience) ----
     async def _arun(self, *args, **kwargs):
         # 归一入参:langgraph 会把入参 dict 作为 kwargs;个别路径可能传单个 dict 位置参
         tool_input = dict(kwargs)
@@ -114,31 +127,39 @@ class ExternalToolWrapper(BaseTool):
             if len(args) == 1 and isinstance(args[0], dict) and not tool_input:
                 tool_input = dict(args[0])
         label = self._tool_label
-        for attempt in range(1, self._max_attempts + 1):
-            try:
-                out = await self._inner.ainvoke(tool_input, config=None)
-                return _coerce_text(out)
-            except Exception as e:  # noqa: BLE001 归类后返回,不让异常中止 agent
-                retryable = _looks_retryable(e) or isinstance(e, ToolRetryableError)
-                if retryable and attempt < self._max_attempts:
-                    delay = min(self._base * (2 ** (attempt - 1)), self._max_backoff)
-                    logger.warning(
-                        f"[ExternalToolWrapper:{label}] 第 {attempt} 次失败,{delay:.1f}s 后重试:{type(e).__name__}:{e}"
-                    )
-                    _report_step(f"自动重试{attempt}", {"工具": label, "原因": str(e)[:120], "等待": round(delay, 1)})
-                    await asyncio.sleep(delay)
-                    continue
-                # 确定性错误或重试耗尽 → @@TOOL_ERROR@@ 结构化块(与内置协议一致)
-                logger.error(f"[ExternalToolWrapper:{label}] 调用失败(重试后):{type(e).__name__}:{e}")
-                return tool_error_block(
-                    etype=type(e).__name__,
-                    reason=str(e)[:200],
-                    field=None,
-                    suggestion=(_GEN_RETRY_SUGGESTION if retryable else _GEN_SUGGESTION),
-                    is_retryable=retryable,
-                    attempts=attempt if attempt > 1 else None,
-                )
-        return None  # 不可达,保类型收敛
+
+        def _fallback(exc: BaseException, attempts: int) -> str:
+            """重试耗尽或确定性失败 → @@TOOL_ERROR@@ 结构化块(与内置协议一致)。"""
+            retryable = classify(exc).kind is Kind.TRANSIENT
+            logger.error(f"[ExternalToolWrapper:{label}] 调用失败(重试后):{type(exc).__name__}:{exc}")
+            return tool_error_block(
+                etype=type(exc).__name__,
+                reason=str(exc)[:200],
+                field=None,
+                suggestion=(_GEN_RETRY_SUGGESTION if retryable else _GEN_SUGGESTION),
+                is_retryable=retryable,
+                attempts=attempts if attempts > 1 else None,
+            )
+
+        def _on_retry(attempt: int, exc: BaseException, wait: float, _classified) -> None:
+            logger.warning(
+                f"[ExternalToolWrapper:{label}] 第 {attempt} 次失败,{wait:.1f}s 后重试:"
+                f"{type(exc).__name__}:{exc}"
+            )
+            _report_step(f"自动重试{attempt}",
+                         {"工具": label, "原因": str(exc)[:120], "等待": round(wait, 1)})
+
+        # site 带 mcp: 前缀,便于在指标/日志里与内置工具区分开
+        return await acall(
+            self._inner.ainvoke, tool_input, config=None,
+            site=f"mcp:{label}",
+            fallback=_fallback,
+            retries=max(0, self._max_attempts - 1),
+            base=self._base,
+            max_delay=self._max_backoff,
+            on_retry=_on_retry,
+            on_success=_coerce_text,
+        )
 
 
 def wrap_external_tool(tool: BaseTool, **kw) -> BaseTool:

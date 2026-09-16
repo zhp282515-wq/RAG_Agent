@@ -33,6 +33,22 @@ from langgraph.runtime import Runtime
 
 from utils.config_tool import agent_conf, model_conf
 from utils.logger_tool import logger
+from utils.resilience import call
+from utils.resilience.breaker import breaker_for
+
+# 该调用点在 resilience.yml 里的标识,也是熔断/指标的维度名。
+# 放在模块级常量而不是各处手写字符串,避免改了配置键却漏改读的地方。
+_SUMMARY_SITE = "summarization"
+
+
+class _EmptySummaryError(RuntimeError):
+    """摘要模型返回了空内容。
+
+    空内容在业务上是「没拿到可用摘要」,与超时/限流一样应当走重试与降级,
+    因此显式抛出来交给统一错误分类器,而不是在调用处静默 return None。
+    RuntimeError 不含传输层特征词,分类器会判为 UNKNOWN —— 同样不重试、直接降级,
+    行为与从前的「记一条 warning 然后放弃压缩」一致。
+    """
 
 
 # 中文摘要提示词。必须保留 {messages} 占位符 —— 基类会 summary_prompt.format(messages=...)。
@@ -118,37 +134,12 @@ class TracedSummarizationMiddleware(SummarizationMiddleware):
             trim_tokens_to_summarize=trim_tokens_to_summarize,
         )
         self._trigger_tokens = int(trigger_tokens)
-        # 摘要调用的重试收敛到 2 次:基类默认 with_retry() 重试 3 次,
-        # 遇到持续性故障(key 失效/模型不存在)会让单轮问答白等 5 秒以上。
-        try:
-            self._summary_model = self.model.with_retry(stop_after_attempt=2)
-        except Exception:
-            pass  # 保持基类行为
-        # 熔断:摘要连续失败后短期跳过,避免每次问答都付出重试延迟
-        self._fail_streak = 0
-        self._cooldown_until = 0.0
-
-    # 连续失败达到该次数即进入冷却
-    _FAIL_STREAK_LIMIT = 3
-    _COOLDOWN_SECONDS = 300.0
-
-    def _in_cooldown(self) -> bool:
-        import time as _time
-        return _time.monotonic() < self._cooldown_until
-
-    def _note_failure(self) -> None:
-        import time as _time
-        self._fail_streak += 1
-        if self._fail_streak >= self._FAIL_STREAK_LIMIT:
-            self._cooldown_until = _time.monotonic() + self._COOLDOWN_SECONDS
-            logger.warning(
-                f"TracedSummarization: 摘要连续失败 {self._fail_streak} 次,"
-                f"暂停压缩 {int(self._COOLDOWN_SECONDS)}s(历史照常保留)"
-            )
-
-    def _note_success(self) -> None:
-        self._fail_streak = 0
-        self._cooldown_until = 0.0
+        # 摘要调用的重试/熔断/降级全部交给 utils.resilience(见 _safe_summary)。
+        # 这里只保留一个「未被 retry 包装」的原始模型:
+        #   - 不再调 self.model.with_retry(stop_after_attempt=2):那是 langchain 自带的一层,
+        #     与本项目统一组件叠加会变成「重试的重试」,故障时白等多轮;
+        #   - 不再自己维护 _fail_streak/_cooldown_until 熔断:组件按 site 统一持有。
+        self._summary_model = self.model
 
     # ---------- 阈值判定:叠加真实 token 口径 ----------
 
@@ -181,9 +172,13 @@ class TracedSummarizationMiddleware(SummarizationMiddleware):
         if not self._should_summarize(messages, total_tokens):
             return None
 
-        # 熔断中:不再尝试摘要,直接放行原历史(上下文会继续增长,但不等重试)
-        if self._in_cooldown():
-            logger.debug("TracedSummarization: 摘要处于冷却期,本轮跳过压缩")
+        # 熔断中不再尝试摘要,直接放行原历史(上下文会继续增长,但不等重试)。
+        # 熔断状态由 utils.resilience 按 site 统一持有 —— 以前这里自己数 _fail_streak,
+        # 现在读组件,好处是「摘要熔断」和别的调用点用的是同一套阈值/冷却语义。
+        # 提前返回只是省掉一次注定被短路的调用(以及它的 phase_start/phase_end 噪声);
+        # 真正兜底的是 _safe_summary 里的降级路径。
+        if not breaker_for(_SUMMARY_SITE).allow()[0]:
+            logger.debug("TracedSummarization: 摘要处于熔断冷却期,本轮跳过压缩")
             return None
 
         cutoff_index = self._determine_cutoff_index(messages)
@@ -205,13 +200,10 @@ class TracedSummarizationMiddleware(SummarizationMiddleware):
         dur = _time.perf_counter() - t0
 
         if not summary:
-            self._note_failure()
             trace_emit(runtime, "上下文压缩", "phase_end", "summarization", dur,
                        {"status": "跳过", "说明": "摘要生成失败,已保留完整历史"}, ph_id=ph_id)
             logger.warning("TracedSummarization: 摘要生成失败,本轮不压缩(历史完整保留)")
             return None
-
-        self._note_success()
 
         new_messages = [HumanMessage(content=f"{ZH_SUMMARY_PREFIX}{summary}")]
         payload = [RemoveMessage(id=REMOVE_ALL_MESSAGES), *new_messages, *preserved]
@@ -241,27 +233,46 @@ class TracedSummarizationMiddleware(SummarizationMiddleware):
 
         基类 _create_summary 会把异常抛给调用方 —— 在本项目的调用位置(模型节点内)
         没有任何兜底,异常就等于整轮失败。这里显式收敛为 None。
+
+        重试/退避/熔断/日志/指标由 utils.resilience 统一处理:
+          - 瞬时错误(超时/限流/5xx)按 resilience.yml 的 sites.summarization 重试
+            (当前 max_retries=1,与原 stop_after_attempt=2 一致),退避带抖动;
+          - 确定性错误(如 key 失效 → 401)不重试,直接降级,并触发告警;
+          - 连续失败达阈值 → 组件熔断该 site,冷却期内直接返回 None(不再白等重试)。
+        降级路径不变:返回 None ⇒ 本轮不压缩,完整历史保留。
         """
         if not messages:
             return None
-        try:
-            trimmed = self._trim_messages_for_summary(messages)
-            if not trimmed:
-                return None
-            formatted = self._format_for_summary(trimmed)
+        trimmed = self._trim_messages_for_summary(messages)
+        if not trimmed:
+            return None
+        formatted = self._format_for_summary(trimmed)
+        prompt = self.summary_prompt.format(messages=formatted).rstrip()
+
+        def _call_summary():
             resp = self._summary_model.invoke(
-                self.summary_prompt.format(messages=formatted).rstrip(),
-                config={"metadata": {"lc_source": "summarization"}},
+                prompt,
+                # callbacks=[] 与 query_rewrite 同理:本中间件在模型节点内执行,若不显式
+                # 清空,摘要调用的 token 可能继承 agent 的推流回调、被当成回答推给前端
+                # (已在 query_rewrite 上真实复现过同类问题)。当前时序(before_model)
+                # 下尚未观察到泄漏,这里按同样写法加固。
+                # metadata.lc_source 供 agent 流式层识别跳过(第二道防线)。
+                config={"callbacks": [], "metadata": {"lc_source": "summarization"}},
             )
             text = (getattr(resp, "text", "") or "").strip()
             if not text:
-                logger.warning("TracedSummarization: 摘要模型返回空内容")
-                return None
+                # 空内容视同失败:交给统一驱动重试/降级,而不是在这里静默吞掉
+                raise _EmptySummaryError("摘要模型返回空内容")
             self._capture_summary_usage(resp)
             return text
-        except Exception as e:
-            logger.warning(f"TracedSummarization: 摘要生成失败({type(e).__name__}): {e}")
+
+        def _fallback(exc: BaseException, attempts: int) -> None:
+            logger.warning(
+                f"TracedSummarization: 摘要生成失败({type(exc).__name__},已尝试 {attempts} 次): {exc}"
+            )
             return None
+
+        return call(_call_summary, site=_SUMMARY_SITE, fallback=_fallback)
 
     @staticmethod
     def _capture_summary_usage(resp) -> None:

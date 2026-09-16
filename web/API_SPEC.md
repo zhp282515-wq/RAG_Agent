@@ -238,7 +238,9 @@ file_name 需 URL 编码;支持可选 query 参数 `store`。
 `未配置模型服务 API Key,请先在「系统配置 → 对话模型」填入 API Key 后再使用`。
 
 ## 9. 工具(系统配置 → 工具,MySQL tool_registry)
-可插拔工具注册表:7 个内置工具默认全开、可独立启停;外部 MCP 工具(stdio/http)注册挂载。
+可插拔工具注册表:8 个内置工具默认全开、可独立启停;外部 MCP 工具(stdio/http)注册挂载。
+检索类内置工具两个:`search_knowledge_base`(推荐入口,内部含「问题改写 → 一致性自检 →
+分级路由」闭环,入参为**用户原始问题**)与 `get_rerank_retriever`(直通检索,入参为检索词)。
 工具启停/注册变化会 bump 服务端 agent 缓存版本 → **下次提问自动重建 agent**(新工具集生效)。
 
 ### GET /api/tools

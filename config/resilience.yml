@@ -1,0 +1,74 @@
+# 失败处理配置(重试 / 退避 / 熔断 / 降级 / 缓存 / 观测)
+#
+# 全项目所有外部调用(LLM、工具、HTTP、向量库)共用这一套。调用点只提供「降级函数 +
+# 调用点标识」,重试/退避/熔断/日志全部由 utils/resilience 统一处理。
+#
+# 配置优先级(低 → 高):
+#   utils/resilience/config.py 的 _DEFAULTS
+#     < 本文件顶层键
+#     < 本文件 sites.<调用点标识>.<键>
+#     < 环境变量 RESILIENCE_<键名大写>
+#     < call()/guard() 的显式 kwargs
+#
+# 不做运行时热加载:改完重启生效(与 model.yml / rag.yml / vector_store.yml 一致)。
+
+enabled: true
+
+# ---- 重试与退避(全局默认;各调用点可覆盖) ----
+default_max_retries: 2        # 失败后最多再试 2 次 => 最多 3 次调用
+base_delay: 0.5               # 首次重试等待;退避 = min(base * 2**retry_index, max_delay)
+max_delay: 8.0                # 单次退避上限
+jitter_ratio: 0.5             # 抖动 = random(0, 退避 * jitter_ratio),避免下游被打爆
+retry_after_cap: 60.0         # 429/503 的 Retry-After 封顶,防上游给天文数字卡死交互
+
+# ---- 分场景重试预算(attempts = retries + 1) ----
+interactive_max_retries: 1    # 交互式(用户等待):2 次尝试
+background_max_retries: 3     # 后台/批处理:4 次尝试
+streaming_max_retries: 0      # 已开始输出的流:不重试(重放会产生重复 token)
+default_timeout_budget: 20.0  # 单次调用(含全部重试)的总耗时预算,超预算直接降级
+
+# ---- 熔断 ----
+# 瞬时错误在窗口内连续失败达阈值即打开;打开期间直接降级、不再调用。
+# 冷却到期放探针试探,探针失败则冷却按 open_backoff_factor 指数延长。
+# 确定性错误不触发熔断(重试结果一样,熔断无意义),只告警。
+breaker_enabled: true
+breaker_failure_threshold: 5
+breaker_window_seconds: 60
+breaker_cooldown_seconds: 30
+breaker_probe_calls: 1
+breaker_open_backoff_factor: 2.0
+breaker_max_cooldown_seconds: 300
+
+# ---- 成功结果缓存 ----
+# 默认关。改写链路已有自己的 LRU(utils/query_rewrite/pipeline.py),工具站点数据实时性强,
+# 都不适合再叠一层。新调用点若要缓存,显式传 cache=True。
+cache_enabled: false
+cache_ttl_seconds: 300
+cache_max_size: 512
+
+# ---- 观测 ----
+log_enabled: true             # 每次调用/重试/降级/熔断输出一行结构化日志
+alert_enabled: true           # 配置类错误(401/403/参数/工具不存在)告警
+
+# ---- 按调用点覆盖(键 = site id) ----
+# 下面几项刻意对齐原有行为,避免「接入统一组件」变成一次静默回归。
+sites:
+  # 摘要:原实现是 stop_after_attempt=2 + 自建 300s 冷却
+  summarization:
+    max_retries: 1
+    breaker_cooldown_seconds: 300
+
+  # 改写:原实现恰好重试一次;交互式链路,退避要短
+  rewriter:
+    max_retries: 1
+    base_delay: 0.2
+
+  # 工具:原 with_retry(max_attempts=3/4) => 2/3 次重试
+  get_weather:
+    max_retries: 3
+  get_user_location:
+    max_retries: 3
+  get_rerank_retriever:
+    max_retries: 2
+  search_knowledge_base:
+    max_retries: 2

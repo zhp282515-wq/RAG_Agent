@@ -1,0 +1,164 @@
+# RAG 检索前处理配置(用户问题改写 + 一致性自检 + 分级路由)
+#
+# 本文件此前为空(rag_conf 被 config_tool 加载但无人读取)。改写模块在此落配置。
+# 注意:「改写」只决定检索用什么查询串;真正的检索参数(top_k / rerank_n /
+# score_high / score_min)在 config/vector_store.yml,且可在「系统配置」页运行时
+# 覆盖(存 MySQL app_settings),不放这里、避免两处配置打架。
+
+rewrite:
+  # ---- 总开关 ----
+  enabled: true              # false = 完全不调 LLM,直通原问题检索(零成本降级)
+  # 「系统配置」页的运行时开关(MySQL app_settings 键 rag.rewrite_enabled)优先级
+  # 高于本项:两者任一为 false 即关闭。
+
+  # ---- 改写模型 ----
+  # 留空 = 复用 model.yml 的 summary_model(qwen3.7-flash),与上下文压缩共用同一
+  # 轻量档。**不要把对话主模型(qwen3.8-flash)用在这里**,改写只是补全/消歧/术语归一。
+  model: ""
+  temperature: 0             # 改写必须稳定可复现,固定 0
+  # 关闭思维链(强烈建议保持 true)。改写是"照铁律机械执行"的任务,规则与 few-shot
+  # 已把要求写死,模型不需要独立思考。实测(qwen3.7-flash):
+  #   开启思考 → 18.4s 且失败(1500 个 reasoning token 吃光 max_tokens,JSON 正文无处可写)
+  #   关闭思考 →  3.1s 且成功
+  # 6 倍提速,且不再撞 max_tokens。代价:模型少了一次"自检式推理",但忠实度主要由
+  # 规则硬校验(HardChecker)保证,不依赖模型的思考过程。
+  disable_thinking: true
+  # DashScope 的 OpenAI 兼容端点。留空 = 复用 .env 的 DASHSCOPE_BASE_URL
+  # (该变量当前为空时,SDK 走默认 https://dashscope.aliyuncs.com/compatible-mode/v1)。
+  # 只有当项目没有可用 base_url 时才需要在这里显式填。
+  base_url: ""
+  timeout: 15                # 单次改写调用的硬超时(秒);超时即降级 use_original
+  # 输出上限。注意**思维链模型把推理 token 也算在内**:实测开着思考时 1500 会被
+  # reasoning_tokens 全部占满,JSON 正文无 token 可写 → LengthFinishReasonError。
+  # 因为 disable_thinking 默认已关思考,1500 对"只输出结构化 JSON"是够的;
+  # 若把 disable_thinking 改回 false,必须同步放大本值(实测 4000 才够)。
+  max_tokens: 1500
+
+  # ---- 决策阈值 ----
+  conf_high: 0.9             # self_check 全 true 且 confidence >= 此值 → use_rewritten
+  conf_mid: 0.75             # confidence 落在此值与 conf_high 之间 → dual_retrieval
+                             # 低于此值 → use_original
+  sim_min: 0.75              # 原问题/改写后问题的 embedding 余弦相似度下限,
+                             # 低于此值 → 硬校验判死 → use_original
+  jaccard_clarify: 0.6       # LLM 给出 ask_clarify 时,改写与原问题的 Jaccard 下限:
+                             # 只有「几乎没改写」才认为追问合理;实质改写了却是追问
+                             # → 模型在答非所问,降级 use_original
+
+  # ---- 快速直通(省一次 LLM 调用)----
+  # 真实数据:17 次真实改写里有 10 次最终落在 use_original(改写成果没被采用),
+  # 每次白花十几秒。开启后,对「本身已是规范检索句」的问题(已含领域专名、无指代词、
+  # 无口语寒暄、长度足够)纯用规则判定为无需改写,**直接跳过 LLM**,零延迟零成本。
+  # 判定口径保守(见 glossary.looks_no_rewrite_needed):宁可多调一次模型,
+  # 也不要因为误判而丢掉指代消解/口语规范化的收益。
+  skip_when_no_rewrite_needed: true
+
+  # ---- 输入预算(控 token / 控延迟) ----
+  history_turns: 3           # 传给改写模型的历史轮数(仅用于指代消解,不是全量历史)
+  history_char_budget: 1200  # 历史文本字符上限,超出从头截断(保留最近的)
+
+  # ---- 缓存 ----
+  cache_enabled: true
+  cache_size: 512            # 进程内 LRU 容量(query → 决策 + 原问题向量)
+
+  # ---- 日志 ----
+  log_enabled: true          # 每次调用追加一行 JSON 到 logs/rewrite_YYYY-MM-DD.jsonl
+
+  # ---- 保护词典 ----
+  # 命中这些词的改写必须原样保留。规则层逐条硬校验,任何一条不通过都直接
+  # 覆盖 LLM 的 decision 为 use_original(规则优先于模型自检)。
+
+  # 否定词:多字词优先匹配(不再/没有 不会被拆成 不+再),计数必须一一对应
+  negations: ["不再", "不能", "不会", "不要", "不用", "不是", "不", "没有", "没用", "无法",
+              "非", "除", "无", "未", "别", "莫", "免", "勿"]
+
+  # 条件词
+  conditions: ["如果", "假如", "若", "当", "除非", "只要", "只有", "一旦", "条件下"]
+
+  # 比较词
+  comparatives: ["比", "更", "最", "不如", "优于", "差不多", "一样", "更差"]
+
+  # 量词/范围词
+  quantifiers: ["所有", "全部", "部分", "仅", "只", "每个", "任一", "任何", "大多数", "少数"]
+
+  # 模糊/多意图信号词:命中即倾向追问或回退(不直接决定,交 HardChecker 与 LLM 决策)
+  vague_markers: ["怎么样", "如何", "好不好", "行不行", "怎么办", "什么情况", "能不能", "值得吗", "划算吗"]
+
+  # 时间词正则(原问题命中就必须在改写后存在,且数量一致)
+  time_patterns:
+    - '\d{4}\s*年'
+    - '\d{1,2}\s*月'
+    - '\d{1,2}\s*[日号]'
+    - '\d+\s*(?:天|周|个?月|年|小时|分钟|秒)'
+    - '今天|明天|昨天|前天|后天|目前|当前|现在|最近|近期|本(?:月|周|年)|上(?:月|周|年)|下(?:月|周|年)'
+
+  # 领域保护专名:扫地/扫拖机器人语料里的产品、部件、耗材、技术与品牌。
+  # 这是**可扩充**的白名单——用 eval 脚本发现新专名后加到这里即可。
+  domain_terms:
+    # 品类
+    - 扫地机器人
+    - 扫拖一体机器人
+    - 拖地机器人
+    - 洗地机
+    # 部件
+    - 主刷
+    - 边刷
+    - 滚刷
+    - 胶刷
+    - 尘盒
+    - 集尘袋
+    - 拖布
+    - 抹布
+    - 挂架
+    - 充电座
+    - 充电桩
+    - 基站
+    - 水箱
+    - 滤网
+    - 传感器
+    - 激光雷达
+    - 万向轮
+    # 耗材
+    - 滤芯
+    - 滤网
+    - 清洁剂
+    - 消毒液
+    - 除菌液
+    - 地板清洁液
+    # 材料
+    - 甲醛
+    - 苯
+    - VOC
+    - PM2.5
+    # 技术
+    - 激光导航
+    - 视觉导航
+    - dToF
+    - SLAM
+    - 陀螺仪
+    - 电控水箱
+    - 自动集尘
+    - 自动洗拖布
+    - 热风烘干
+    - 电解水
+    - 银离子
+    - 除菌
+    - 抑菌
+    # 参数
+    - 吸力
+    - Pa
+    - 续航
+    - 噪音
+    - 分贝
+    - 越障
+    - 爬坡
+    - 地毯
+    - 防撞
+    - 避障
+    # 品牌
+    - 科沃斯
+    - 石头
+    - 小米
+    - 追觅
+    - 云鲸
+    - 添可
+    - iRobot

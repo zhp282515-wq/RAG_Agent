@@ -2,6 +2,7 @@ import os.path
 import os
 import csv
 import re
+import time
 from langchain_core.tools import tool
 from vector_store.vector_store import VectorStoreService, VectorSearchError
 from utils.logger_tool import logger
@@ -121,6 +122,53 @@ def _record_sources(hits: list[dict]) -> None:
         logger.debug(f"【工具执行】[get_rerank_retriever] 记录来源失败(忽略):{e}")
 
 
+def _finalize_hits(hits: list[dict], *, score_high: float, score_min: float,
+                   on_step, tag: str) -> str:
+    """过滤到达标线、上报来源、格式化为给模型看的紧凑文本。
+
+    两个检索工具(get_rerank_retriever / search_knowledge_base)共用这一段,保证
+    「相关度分级、超长截断但保留图片描述段、来源上报」的口径完全一致 —— 否则同一份
+    资料经两条链路进来会呈现不同的相关度等级与正文长度。
+    """
+    if not hits:
+        _record_sources([])
+        on_step("达标过滤", {"说明": "无候选命中"})
+        logger.warning(f"【工具执行】[{tag}] 未检索到相关资料")
+        return "未检索到相关资料"
+
+    relevant = [h for h in hits if h.get("score", 0) >= score_min]
+    dropped = len(hits) - len(relevant)
+    if dropped:
+        logger.debug(f"【工具执行】[{tag}] 过滤 {dropped} 条低相关(<{score_min})")
+        on_step("达标过滤", {"通过": len(relevant), "剔除低相关": dropped, "阈值": score_min})
+    else:
+        on_step("达标过滤", {"通过": len(relevant), "阈值": score_min})
+    # 结构化来源同步写入中间件线程本地,web 层据此推送 sources 事件(无命中时写空列表)
+    _record_sources(relevant)
+    if not relevant:
+        logger.warning(f"【工具执行】[{tag}] 无相关度达标资料(全部<{score_min})")
+        return f"未检索到相关资料(所有候选相关度均低于 {score_min})"
+
+    parts = []
+    for h in relevant:
+        text = h.get("text", "")
+        if len(text) > _MAX_CHUNK_CHARS:
+            head = text[:_MAX_CHUNK_CHARS]
+            # 若截断点切进了图片描述段(===开头但未闭合),截断点退到该段之前,保证图片描述完整;
+            # 若图片段从正文开头开始(img_pos==0),直接截断即可,否则退到 0 会把整段截成空
+            img_pos = head.rfind("===[本页图片")
+            if img_pos > 0 and "====================" not in head[img_pos:]:
+                text = head[:img_pos].rstrip()
+            else:
+                text = head
+        score = h.get("score", 0)
+        parts.append(
+            f"【来源:{h.get('file_name', '')} | 相关度:{_score_label(score, score_high)}({score:.3f})】\n{text}"
+        )
+    logger.debug(f"【工具执行】[{tag}] 命中 {len(parts)} 条资料")
+    return "\n\n".join(parts)
+
+
 @tool(description="根据问题在向量知识库中检索扫地/扫拖机器人相关资料,返回带来源与相关度等级的资料片段列表;资料正文中可能包含===[本页图片 N]===开头的图片文字描述")
 @with_retry(max_attempts=3, tool_name="get_rerank_retriever")
 def get_rerank_retriever(query: str) -> str:
@@ -148,49 +196,111 @@ def get_rerank_retriever(query: str) -> str:
             top_k=top_k, rerank_n=rerank_n,
             on_step=_step, raise_on_infra_error=True,
         )(query)
-        if not hits:
-            _record_sources([])
-            _step("达标过滤", {"说明": "无候选命中"})
-            logger.warning(f"【工具执行】[get_rerank_retriever] 未检索到相关资料")
-            return "未检索到相关资料"
-
-        relevant = [h for h in hits if h.get("score", 0) >= score_min]
-        dropped = len(hits) - len(relevant)
-        if dropped:
-            logger.debug(f"【工具执行】[get_rerank_retriever] 过滤 {dropped} 条低相关(<{score_min})")
-            _step("达标过滤", {"通过": len(relevant), "剔除低相关": dropped, "阈值": score_min})
-        else:
-            _step("达标过滤", {"通过": len(relevant), "阈值": score_min})
-        # 结构化来源同步写入中间件线程本地,web 层据此推送 sources 事件(无命中时写空列表)
-        _record_sources(relevant)
-        if not relevant:
-            logger.warning(f"【工具执行】[get_rerank_retriever] 无相关度达标资料(全部<{score_min})")
-            return f"未检索到相关资料(所有候选相关度均低于 {score_min})"
-
-        parts = []
-        for h in relevant:
-            text = h.get("text", "")
-            if len(text) > _MAX_CHUNK_CHARS:
-                head = text[:_MAX_CHUNK_CHARS]
-                # 若截断点切进了图片描述段(===开头但未闭合),截断点退到该段之前,保证图片描述完整;
-                # 若图片段从正文开头开始(img_pos==0),直接截断即可,否则退到 0 会把整段截成空
-                img_pos = head.rfind("===[本页图片")
-                if img_pos > 0 and "====================" not in head[img_pos:]:
-                    text = head[:img_pos].rstrip()
-                else:
-                    text = head
-            score = h.get("score", 0)
-            parts.append(
-                f"【来源:{h.get('file_name', '')} | 相关度:{_score_label(score, score_high)}({score:.3f})】\n{text}"
-            )
-        logger.debug(f"【工具执行】[get_rerank_retriever] 命中 {len(parts)} 条资料")
-        return "\n\n".join(parts)
+        # 过滤/分级/来源上报/格式化统一走 _finalize_hits,与 search_knowledge_base 口径一致
+        return _finalize_hits(hits, score_high=score_high, score_min=score_min,
+                              on_step=_step, tag="get_rerank_retriever")
     except VectorSearchError as e:
         logger.error(f"【工具执行】[get_rerank_retriever] 检索基础设施故障:{e}")
         raise ToolRetryableError(str(e)) from e
     except Exception as e:
         logger.error(f"【工具执行】[get_rerank_retriever] 检索失败:{e}")
         return "检索失败,请稍后重试"
+
+
+@tool(description="知识库检索(推荐优先使用):把用户的原始问题原文直接传入,系统会自动做问题改写、一致性自检与分级路由后再检索,并在改写不可靠时自动回退到原问题;返回带来源与相关度等级的资料片段列表;资料正文中可能包含===[本页图片 N]===开头的图片文字描述")
+@with_retry(max_attempts=3, tool_name="search_knowledge_base")
+def search_knowledge_base(query: str) -> str:
+    """带改写闭环的知识库检索:**传原始问题原文**,不要自己改写。
+
+    与 get_rerank_retriever 的区别:后者是直通检索(检索词由模型给定),1
+    本工具内部跑「改写 → 规则硬校验 → 分级路由 → 检索」的闭环,具备:
+      - 一致性自检:改写是否忠实于原问题由规则层复核(否定词/数字/实体/相似度);
+      - 自动回退:任何自检不过或改写不可用,一律退回用**原问题**检索;
+      - 分级路由:改写可信则用改写、没把握则原问题与改写双路检索合并;
+      - 需要澄清时直接返回追问指引,不检索(避免瞎猜)。
+
+    因此**不要把用户问题先改写成专业术语再传进来** —— 那会让自检失去基准,
+    闭环的价值就没了。
+
+    Args:
+        query: 用户原始问题原文(原样传入,无需清洗或改写)
+    """
+    try:
+        logger.debug(f"【工具执行】[search_knowledge_base] 原始问题:{query}")
+        # 每次检索现读全局设置(系统配置页可改)→「下次提问/下次检索即生效」
+        score_high = _score_high()
+        score_min = _score_min()
+        top_k = _top_k()
+        rerank_n = _rerank_n()
+
+        def _step(name, info=None, tokens=None):
+            tool_step(name, info, tokens=tokens)
+
+        def _phase(action, name, params=None, duration=None, tokens=None):
+            """把闭环内部的阶段上报成工作流面板上的平级阶段(改写/检索)。"""
+            try:
+                from ReAct.middleware.agent_middleware import tool_phase_start, tool_phase_end
+            except Exception:
+                return
+            if action == "start":
+                tool_phase_start(name, params)
+            else:
+                tool_phase_end(name, params, duration=duration, tokens=tokens)
+
+        # 延迟 import:改写模块会拉起 modelfactory/settings_store,放顶层会拖慢
+        # 未启用该工具时的 agent 启动。此处引用失败即降级为直通检索。
+        try:
+            from utils.query_rewrite import plan_query, DECISION_ASK_CLARIFY
+            from ReAct.middleware.agent_middleware import current_history_for_rewrite
+        except Exception as e:
+            logger.warning(f"【工具执行】[search_knowledge_base] 改写模块不可用,直通检索:{e}")
+            plan_query = None
+            DECISION_ASK_CLARIFY = "ask_clarify"
+
+        if plan_query is not None:
+            history = None
+            try:
+                # 取最近几轮对话供指代消解(改写模块内部还有轮数/字符预算封顶)
+                history = current_history_for_rewrite()
+            except Exception as e:
+                logger.debug(f"【工具执行】[search_knowledge_base] 取历史失败(仅影响指代消解):{e}")
+
+            plan = plan_query(query, history=history, top_k=top_k, rerank_n=rerank_n,
+                              on_step=_step, phase_emit=_phase)
+            if plan.decision == DECISION_ASK_CLARIFY:
+                # 追问分支不检索:没搞清问什么就检索只会白花 embedding 钱并答偏
+                _record_sources([])
+                return plan.clarify or "【需要澄清】该问题信息不足,请先向用户确认具体想问什么。"
+
+            if plan.error:
+                # 检索失败(基础设施故障)交给统一重试机制,与旧工具行为保持一致
+                raise ToolRetryableError(plan.error)
+
+            return _finalize_hits(plan.hits, score_high=score_high, score_min=score_min,
+                                  on_step=_step, tag="search_knowledge_base")
+
+        # 降级路径:改写模块 import 失败,退回直通检索(仍比整条链路不可用要好)。
+        # 这条路径没有改写阶段,但仍要发「知识库检索」阶段 —— 本工具属于
+        # SELF_PHASED_TOOLS,monitor_tool 不会替它发容器阶段,漏发会让面板少一整段。
+        _phase("start", "知识库检索", {"检索词": query, "说明": "改写模块不可用,直通检索"})
+        _plan_t0 = time.perf_counter()
+        try:
+            hits = VectorStoreService(collection_name=_current_store()).get_rerank_retriever(
+                top_k=top_k, rerank_n=rerank_n, on_step=_step, raise_on_infra_error=True,
+            )(query)
+        finally:
+            _phase("end", "知识库检索", {"命中": -1}, duration=time.perf_counter() - _plan_t0)
+        return _finalize_hits(hits, score_high=score_high, score_min=score_min,
+                              on_step=_step, tag="search_knowledge_base")
+    except VectorSearchError as e:
+        logger.error(f"【工具执行】[search_knowledge_base] 检索基础设施故障:{e}")
+        raise ToolRetryableError(str(e)) from e
+    except ToolRetryableError:
+        raise
+    except Exception as e:
+        logger.error(f"【工具执行】[search_knowledge_base] 检索失败:{e}")
+        return "检索失败,请稍后重试"
+
 
 
 @tool(description="获取指定城市的天气，以消息字符串的形式返回")

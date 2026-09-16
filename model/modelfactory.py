@@ -54,7 +54,9 @@ class ChatModelService(BaseModelService):
     def get_model_service(self, model=model_conf["model"],
                           api_key: str | None = None,
                           base_url: str | None = None,
-                          temperature: float | None = None) -> _ConfigurableModel:
+                          temperature: float | None = None,
+                          max_tokens: int | None = None,
+                          extra_body: dict | None = None) -> _ConfigurableModel:
         # key 未显式传入 → 取当前生效 key(DB 优先,回退 .env)
         if api_key is None:
             api_key = dashscope_api_key()
@@ -63,23 +65,41 @@ class ChatModelService(BaseModelService):
         kw = {"model": model or None, "api_key": api_key or None, "base_url": base_url or None}
         if temperature is not None:
             kw["temperature"] = temperature
+        if max_tokens is not None:
+            kw["max_tokens"] = int(max_tokens)
+        # extra_body 必须在**构造期**传入才能生效:实测把它放进 invoke 的 config
+        # (extra_body=...) 对 DashScope 无效,enable_thinking 会被忽略、思考照旧发生。
+        if extra_body:
+            kw["model_kwargs"] = {"extra_body": dict(extra_body)}
         return init_chat_model(**kw)
 
 
-def get_chat_model(model: str, temperature: float | None = None) -> _ConfigurableModel:
+def get_chat_model(model: str, temperature: float | None = None,
+                   max_tokens: int | None = None,
+                   extra_body: dict | None = None) -> _ConfigurableModel:
     """按模型名建聊天模型(web 前端可在 qwen3.x 系列间切换)。
 
     模型名可能是裸名(qwen3.8-flash)或带 provider(openai:qwen3.8-flash)。
     DashScope 走 OpenAI 兼容端点,裸名无法被 init_chat_model 推断 provider,
     这里统一补 openai: 前缀,确保真正切到目标模型而非静默回退默认。
-    temperature: 可选,透传给 init_chat_model(系统配置页可改)。
+
+    Args:
+        model: 模型名(裸名或 provider:name)
+        temperature: 可选,透传给 init_chat_model(系统配置页可改)
+        max_tokens: 可选,输出上限(含推理 token)
+        extra_body: 可选,厂商特有参数。**构造期传入才有效** —— 例如 DashScope 的
+            `{"enable_thinking": False}` 关掉思维链(放 invoke 的 config 里会被忽略)。
+            带 extra_body 时会改用 model_kwargs 传参,langchain 会有一条 UserWarning
+            提示"应显式指定",属已知且无害的噪音。
     """
     name = str(model or "").strip()
     if not name:
         raise ValueError("model 不能为空")
     if ":" not in name:
         name = f"openai:{name}"
-    return ChatModelService().get_model_service(model=name, temperature=temperature)
+    return ChatModelService().get_model_service(
+        model=name, temperature=temperature, max_tokens=max_tokens, extra_body=extra_body,
+    )
 
 class EmbeddingModelService(BaseModelService):
     """嵌入模型服务"""

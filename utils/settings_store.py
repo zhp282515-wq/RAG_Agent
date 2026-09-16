@@ -36,6 +36,10 @@ MODEL_DEFAULTS: dict[str, object] = {
 # 知识库:agent 检索时查询的「当前向量库」(回退 vector_store.yml 的 collection_name)
 RAG_DEFAULTS: dict[str, object] = {
     "rag.current_store": vector_store_conf.get("collection_name", "document_chunks"),
+    # 检索前「问题改写闭环」总开关(Mysql 运行时开关,与 config/rag.yml 的
+    # rewrite.enabled 是「与」关系,任一为 false 即关闭)。关闭后完全不调改写模型,
+    # 直接用用户原问题检索。默认开启;前端暂未提供改这项的界面,可直接改库。
+    "rag.rewrite_enabled": True,
 }
 
 _DEFAULTS = {**RETRIEVAL_DEFAULTS, **MODEL_DEFAULTS, **RAG_DEFAULTS}

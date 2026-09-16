@@ -141,6 +141,14 @@ export function buildStages(events, now = Date.now()) {
     } else if (s.step === "检索") {
       seenRetrieval = true;
       s.semantic = "在知识库中向量召回 → rerank 精排 → 达标过滤";
+    } else if (s.step === "问题改写") {
+      // 改写先于检索发生,本身不算"已检索";这里刻意不置 seenRetrieval,
+      // 否则同轮内改写之后的模型阶段会被误标成"评估检索结果"。
+      s.semantic = "补全/消歧/术语规范化,并自检是否忠实于原问题";
+    } else if (s.step === "知识库检索") {
+      // 自管阶段工具的检索阶段:它已经吸收了改写阶段的产出,语义按"检索"处理
+      seenRetrieval = true;
+      s.semantic = "在知识库中向量召回 → rerank 精排 → 达标过滤";
     } else if (s.step === "报告场景") {
       s.semantic = "读取并填充报告所需的用户使用数据";
     }
@@ -153,17 +161,46 @@ export function runningAction(s) {
   const step = s.step || "";
   if (step === "模型") return s.semantic || "模型正在思考…";
   if (step === "检索") return "正在检索知识库…";
+  if (step === "问题改写") return "正在改写并自检…";
+  if (step === "知识库检索") return "正在检索知识库…";
   if (step === "报告场景") return "正在读取报告数据…";
   if (s.name && s.name !== step) return `正在执行 ${s.name}…`;
   return `${step} 处理中…`;
 }
 
-/** 重要参数可视化(检索词/命中数/用户/月份/上下文条数/子步/压缩量) */
+/** 决策码 → 面板上的中文说法(后端给的是 use_rewritten 这类码值,直接展示可读性差) */
+export const DECISION_LABELS = {
+  use_rewritten: "采用改写",
+  dual_retrieval: "双路检索",
+  use_original: "采用原问题",
+  ask_clarify: "需澄清",
+};
+
+/** 重要参数可视化(检索词/命中数/用户/月份/上下文条数/子步/压缩量/改写自检) */
 export function paramsText(params) {
   if (!params) return "";
   const parts = [];
+  // 改写阶段:把「原问题 → 改写」合成一段箭头表达,比两个独立字段省横向空间也更直观
+  if (params["原问题"] != null) {
+    const rewritten = params["改写"];
+    parts.push(rewritten
+      ? `原问题:${params["原问题"]} → ${rewritten}`
+      : `原问题:${params["原问题"]}`);
+  }
   if (params.query) parts.push(`检索词:${params.query}`);
-  if (params["命中"] != null) parts.push(`命中 ${params["命中"]} 条`);
+  if (params["检索词"]) parts.push(`检索词:${params["检索词"]}`);
+  if (params["命中"] != null && Number(params["命中"]) >= 0) {
+    parts.push(`命中 ${params["命中"]} 条`);
+  }
+  if (params["决策"]) {
+    parts.push(`决策 ${DECISION_LABELS[params["决策"]] || params["决策"]}`);
+  }
+  if (params["置信度"] != null) parts.push(`置信度 ${params["置信度"]}`);
+  if (params["相似度"] != null) parts.push(`相似度 ${params["相似度"]}`);
+  // 回退与违规项是"改写没被采用"的原因,给个醒目标记,便于一眼看出这次为什么没用改写
+  if (params["违规项"]) parts.push(`⚠ ${params["违规项"]}`);
+  if (params["回退"]) parts.push(`已回退:${params["回退"]}`);
+  if (params["缓存"]) parts.push(`缓存${params["缓存"]}`);
   if (params["用户"]) parts.push(`用户 ${params["用户"]}`);
   if (params["月份"]) parts.push(`月份 ${params["月份"]}`);
   if (params["消息"] != null) parts.push(`${params["消息"]} 条上下文`);

@@ -1,8 +1,8 @@
-"""可插拔工具注册表:内置 7 工具(可启停) + 外部 MCP 工具(注册挂载)。
+"""可插拔工具注册表:内置 8 工具(可启停) + 外部 MCP 工具(注册挂载)。
 
 设计要点:
-    - 内置 7 工具(agent_tools)为默认工具,默认全开,可在「系统配置 → 工具」逐个启停。
-      引擎耦合工具(get_rerank_retriever / fill_context_for_report)仍可关:
+    - 内置 8 工具(agent_tools)为默认工具,默认全开,可在「系统配置 → 工具」逐个启停。
+      引擎耦合工具(search_knowledge_base / get_rerank_retriever / fill_context_for_report)仍可关:
       关闭后不被绑定,中间件 monitor_tool 按名字符串特判的分支因工具不执行而自然不触发,
       无需改中间件。
     - 外部 MCP 工具注册后,经 langchain-mcp-adapters 加载为 BaseTool,再包一层
@@ -56,7 +56,8 @@ def run_coro_in_loop(coro) -> any:
 def _builtin_inventory() -> list[dict]:
     from ReAct.tools import agent_tools as at
     specs = [
-        ("get_rerank_retriever", "知识库检索", "检索", "问题经向量召回+rerank精排后返回相关资料", True),
+        ("search_knowledge_base", "知识库检索(改写闭环)", "检索", "传原始问题,系统自动改写+自检+分级路由后检索,改写不可靠时自动回退原问题", True),
+        ("get_rerank_retriever", "知识库检索(直通)", "检索", "给定检索词直接向量召回+rerank精排,不做改写", True),
         ("get_weather", "天气查询", "外部数据", "按城市查实时天气/湿度等", True),
         ("get_user_location", "IP定位城市", "外部数据", "自动定位用户所在城市", True),
         ("get_current_month", "当前月份", "系统", "取系统当前月份/日期", True),
@@ -95,7 +96,8 @@ def builtin_meta() -> list[dict]:
 
 # 引擎耦合工具的 soft 提示(UI 展示;仍允许关)
 ENGINE_SOFT_NOTES = {
-    "get_rerank_retriever": "关闭将禁用知识库检索(无 RAG 问答)",
+    "search_knowledge_base": "关闭将禁用知识库检索(推荐入口,含改写闭环)",
+    "get_rerank_retriever": "关闭将禁用直通检索(改写闭环仍可用)",
     "fill_context_for_report": "关闭将禁用报告自动生成流程",
 }
 
@@ -143,7 +145,7 @@ def _row_to_dict(r) -> dict:
 
 
 def ensure_registry() -> None:
-    """幂等建表 + 种子 7 内置行(须在 init_db 之后调用)。
+    """幂等建表 + 种子全部内置行(须在 init_db 之后调用)。
 
     已存在行(用户改过 enabled 或曾删过外部)不动;只补缺失内置行。
     """
@@ -450,7 +452,7 @@ def _builtin_label(key: str) -> str:
 def enabled_capability_block() -> tuple[str, list[str]]:
     """生成追加到系统提示词的「当前已启用工具清单 + 处理规则」,及已停用内置清单。
 
-    目的:提示词里静态写全了 7 个内置工具的能力说明(供模型理解"有哪些能力")。
+    目的:提示词里静态写全了 8 个内置工具的能力说明(供模型理解"有哪些能力")。
     但**停用某工具后**,必须让模型明确知道该能力当前不可用,才不会假装调用后中断。
     本函数据 tool_registry 当前启停状态生成两段追加文字:
         - 已启用的工具清单(内置 + 外部),模型只能调用这里列出的;

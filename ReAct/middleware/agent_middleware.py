@@ -24,6 +24,8 @@ _tool_sources = threading.local()
 # 工具执行期间的"子步骤发射器"(由 monitor_tool 在 handler() 前后设置/清除,
 # 供工具内部无 runtime 访问权限时上报细化步骤)
 _tool_step_emitter = threading.local()
+# 工具执行期间的"平级阶段发射器"(同上;供 SELF_PHASED_TOOLS 的工具自己开阶段)
+_tool_phase_emitter = threading.local()
 
 
 def new_trace_holder() -> dict:
@@ -34,6 +36,20 @@ def new_trace_holder() -> dict:
     """
     return {"events": [], "sources": None, "report": False, "meta": {}, "_ph": 0,
             "usage": {}, "_usage_v": 0}
+
+
+def _take_open_phase(holder: dict, name: str) -> int | None:
+    """从 holder 里取出最近一个未闭合的同名阶段的 ph_id,并标记为已闭合。
+
+    工具内部用 tool_phase_start 开阶段时,自己拿不到分配出去的 ph_id(分配在中间件
+    里)。闭合时按「后进先出 + 同名匹配」找回它,保证 phase_start/phase_end 能配上对,
+    前端才不会一直显示"进行中"。找不到就返回 None(前端按无 ph 的兼容路径处理)。
+    """
+    open_ph = holder.setdefault("_open_phases", [])
+    for i in range(len(open_ph) - 1, -1, -1):
+        if open_ph[i][0] == name:
+            return open_ph.pop(i)[1]
+    return None
 
 
 def _next_ph(holder: dict | None) -> int | None:
@@ -56,6 +72,39 @@ def tool_step_emit(name: str, params: dict | None = None, duration: float | None
 def _set_tool_step_emitter(emit) -> None:
     """monitor_tool 在 handler 前后设置当前线程的发射器。"""
     _tool_step_emitter.emit = emit
+
+
+def tool_phase_start(name: str, params: dict | None = None) -> None:
+    """工具内部调用:开一个**平级**阶段(与 monitor_tool 的容器阶段同级)。
+
+    为什么需要它:像 search_knowledge_base 这种「自己管流程」的工具,内部依次做
+    改写与检索,希望在工作流面板上体现为两个各自计时的平级阶段(而不是一个笼统的
+    「检索」)。monitor_tool 的容器阶段在 handler() 之前就发了,工具无法在其**前面**
+    插入阶段,所以这类工具改由自己发阶段(见 SELF_PHASED_TOOLS)。
+    """
+    em = getattr(_tool_phase_emitter, "start", None)
+    if em is not None:
+        em(name, params)
+
+
+def tool_phase_end(name: str, params: dict | None = None,
+                   duration: float | None = None,
+                   tokens: int | None = None) -> None:
+    """工具内部调用:闭合一个平级阶段(须与 tool_phase_start 配对,按后进先出)。"""
+    em = getattr(_tool_phase_emitter, "end", None)
+    if em is not None:
+        em(name, params, duration, tokens)
+
+
+def _set_tool_phase_emitter(start, end) -> None:
+    """monitor_tool 在 handler 前后设置当前线程的平级阶段发射器。"""
+    _tool_phase_emitter.start = start
+    _tool_phase_emitter.end = end
+
+
+def _clear_tool_phase_emitter() -> None:
+    _tool_phase_emitter.start = None
+    _tool_phase_emitter.end = None
 
 
 def _clear_tool_step_emitter() -> None:
@@ -83,6 +132,35 @@ def sources_take() -> list[dict] | None:
 # 只在工具执行期间(monitor_tool 的 handler 前后)累加,工具外(文档入库、调试检索)
 # 自动是空操作,不会污染会话统计。
 _tool_usage = threading.local()
+# 会话消息快照(供检索工具做指代消解);见 history_set / current_history_for_rewrite
+_tool_history = threading.local()
+
+
+def history_set(messages: list) -> None:
+    """monitor_tool 在调 handler 前写入当前会话消息(线程本地)。
+
+    用途:改写模块做指代消解时要知道「它/这个」指什么,但工具拿不到 runtime。
+    与 sources_set/usage_add 同一套交接思路 —— 中间件写、工具读、线程本地传。
+    """
+    try:
+        _tool_history.messages = messages
+    except Exception:
+        pass
+
+
+def current_history_for_rewrite(max_messages: int = 8) -> list | None:
+    """取最近若干条会话消息供指代消解;无(非 web / 首次提问)返回 None。
+
+    只取尾部 max_messages 条:改写模块内部还会再按轮数与字符预算裁剪,
+    这里先粗筛一遍,避免把整段长历史搬来搬去。
+    """
+    msgs = getattr(_tool_history, "messages", None)
+    if not msgs:
+        return None
+    try:
+        return list(msgs)[-int(max_messages):]
+    except Exception:
+        return None
 
 
 def usage_active(on: bool) -> None:
@@ -162,7 +240,7 @@ def trace_emit(runtime, step: str, action: str = "phase",
 
 def _display_phase(tool_name: str) -> str:
     """工具名 → 用户可见的阶段名(检索工具独立成「检索」阶段)。"""
-    if tool_name == "get_rerank_retriever":
+    if tool_name in ("get_rerank_retriever", "search_knowledge_base"):
         return "检索"
     if tool_name == "fill_context_for_report":
         return "报告上下文"
@@ -192,6 +270,14 @@ def _extract_month(text: str) -> str | None:
     return None
 
 
+# 自己发平级阶段的工具:monitor_tool 不再为它们发通用容器阶段,改由工具内部按业务
+# 顺序自己发(如 search_knowledge_base 依次发「问题改写」「知识库检索」两个各自计时的
+# 阶段)。原因:改写发生在工具内部,而容器阶段在 handler() 之前就发了,工具无法在其
+# **前面**插入阶段 —— 否则面板上会出现「检索 → 问题改写」这种语义倒序。
+# 其余职责(来源收集 / 用量归因 / 错误包装 / history 快照 / 日志)仍由 monitor_tool 统一处理。
+SELF_PHASED_TOOLS = frozenset({"search_knowledge_base"})
+
+
 @wrap_tool_call
 def monitor_tool(
         request: ToolCallRequest,
@@ -204,9 +290,11 @@ def monitor_tool(
     # 阶段开始事件:检索带改写后检索词,报告带用户id/月份参数
     start_params: dict = {}
     args = request.tool_call.get("args") or {}
-    if tool_name == "get_rerank_retriever":
+    if tool_name in ("get_rerank_retriever", "search_knowledge_base"):
         q = str(args.get("query", "") or "").strip()
-        start_params = {"query": q}
+        # search_knowledge_base 收到的是用户原始问题(改写在其内部完成),
+        # 故这里的标签区分「检索词」与「原始问题」,便于前端如实展示
+        start_params = {("query" if tool_name == "get_rerank_retriever" else "原始问题"): q}
     elif tool_name == "fill_context_for_report":
         uid = str(args.get("user_id", "") or "").strip()
         month = str(args.get("month", "") or "").strip()
@@ -221,10 +309,12 @@ def monitor_tool(
         # 工具执行期间开通子步骤发射:工具内部调 tool_step_emit() 上报细化过程
         parent_phase = _display_phase(tool_name)
         holder = _trace_of(request.runtime)
+        self_phased = tool_name in SELF_PHASED_TOOLS
         # 分配唯一阶段 id → phase_end/substep 都带上它,前端按 id 精确归属
         ph_id = _next_ph(holder) if holder is not None else None
-        trace_emit(request.runtime, parent_phase, "phase_start",
-                   tool_name, None, start_params or None, ph_id=ph_id)
+        if not self_phased:
+            trace_emit(request.runtime, parent_phase, "phase_start",
+                       tool_name, None, start_params or None, ph_id=ph_id)
 
         def _emit_substep(name, params=None, duration=None, tokens=None):
             if holder is not None:
@@ -238,18 +328,42 @@ def monitor_tool(
                     ev["tokens"] = int(tokens)
                 holder["events"].append(ev)
 
+        def _phase_start(name, params=None):
+            """工具内部开一个平级阶段(独立 ph_id,与容器阶段同级)。"""
+            if holder is None:
+                return
+            ph = _next_ph(holder)
+            # 记进未闭合表,供 _phase_end 按名字找回配对
+            holder.setdefault("_open_phases", []).append((name, ph))
+            trace_emit(request.runtime, name, "phase_start", None, None,
+                       params or None, ph_id=ph)
+
+        def _phase_end(name, params=None, duration=None, tokens=None):
+            """闭合工具内部开的平级阶段:按名字从后往前找最近未闭合的同名阶段。"""
+            if holder is None:
+                return
+            ph = _take_open_phase(holder, name)
+            trace_emit(request.runtime, name, "phase_end", None, duration,
+                       params or None, ph_id=ph,
+                       tokens=int(tokens) if tokens else None)
+
         _set_tool_step_emitter(_emit_substep)
+        _set_tool_phase_emitter(_phase_start, _phase_end)
         usage_active(True)
+        # 会话消息快照:检索工具做指代消解(「它/这个」指什么)要用到,
+        # 而工具拿不到 runtime,只能经线程本地转交。放在 handler 之前写入。
+        history_set(list(request.state.get("messages") or []))
         try:
             res = handler(request)
         finally:
             usage_active(False)
             _clear_tool_step_emitter()
+            _clear_tool_phase_emitter()
         dur = _time.perf_counter() - t0
 
         # 检索工具:命中数作为阶段参数,并收集来源
         end_params: dict = {}
-        if tool_name == "get_rerank_retriever":
+        if tool_name in ("get_rerank_retriever", "search_knowledge_base"):
             t = _trace_of(request.runtime)
             srcs = sources_take()
             if t is not None and srcs is not None:
@@ -269,9 +383,15 @@ def monitor_tool(
             for kind, val in totals.items():
                 u[kind] = int(val or 0)
             t["_usage_v"] = t.get("_usage_v", 0) + 1
-        trace_emit(request.runtime, parent_phase, "phase_end",
-                   tool_name, dur, end_params or None, ph_id=ph_id,
-                   tokens=tool_tokens or None)
+        if not self_phased:
+            trace_emit(request.runtime, parent_phase, "phase_end",
+                       tool_name, dur, end_params or None, ph_id=ph_id,
+                       tokens=tool_tokens or None)
+        elif tool_tokens and holder is not None:
+            # 自管阶段的工具:token 已由工具按阶段自行归属(见 agent_tools),
+            # 这里只把累计量留在 holder 供用量条读取,不再发容器 phase_end。
+            u = holder.setdefault("usage", {})
+            u["tool_total"] = int(u.get("tool_total", 0)) + tool_tokens
         logger.info(f"【中间件执行】[monitor_tool] 工具{tool_name}执行成功")
 
         t = _trace_of(request.runtime)

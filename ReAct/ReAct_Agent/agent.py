@@ -35,6 +35,42 @@ from utils.image_input_tool import (
 )
 
 
+# 内部辅助调用产生的流式分片:这些绝不能当回答推给用户。
+#
+# 判据是 langgraph_node —— 实测(真 DashScope + 真 agent)流式分片的 meta 里
+# metadata 里 **没有** lc_source(自定义 metadata 不会透到 stream_mode="messages"
+# 的 meta),但 langgraph_node 稳定可辨:
+#   node='tools'  → 工具内部调用辅助模型(问题改写等)产生的文本 ← 必须丢弃
+#   node='model'  → agent 主模型的正式回答
+# 理论上 node 还可能是 'pre_model_hook' 等钩子节点,一并归入内部。
+_INTERNAL_NODES = frozenset({"tools", "pre_model_hook", "post_model_hook"})
+# 正式回答只来自主模型节点
+_ANSWER_NODES = frozenset({"model"})
+
+
+def _is_internal_chunk(meta) -> bool:
+    """判断一条 stream_mode="messages" 的分片是否来自内部辅助调用(而非主模型回答)。
+
+    背景:改写/摘要等辅助 LLM 调用跑在**工具执行期间**,会继承 agent 的推流回调,
+    其 token 会被 stream_mode="messages" 当成回答推给前端并落库(已真实复现:用户
+    回答里夹着整段改写 JSON)。第一道防线是在各调用处传 config={"callbacks": []}
+    (见 query_rewrite/rewriter.py、summarization_mw.py),但实测仅靠它不够 ——
+    所以这里再加一道,按节点名把工具节点产出的文本整体丢弃。
+
+    工具节点不会产出用户可见回答(回答永远来自 model 节点),因此这里的丢弃是安全的。
+    """
+    if not isinstance(meta, dict):
+        return False
+    node = meta.get("langgraph_node")
+    if node is None:
+        # 拿不到节点名(老版本/非 langgraph 流):退回 lc_source 标记判断
+        md = meta.get("metadata")
+        if isinstance(md, dict) and md.get("lc_source"):
+            return True
+        return False
+    return node not in _ANSWER_NODES
+
+
 def _friendly_model_error(e: Exception) -> str:
     """把模型服务(聊天)的异常转成对用户友好、可指引修复的中文说明。
 
@@ -373,6 +409,7 @@ class ReActAgentService:
             pass
 
         answer_parts: list[str] = []
+        skipped_internal = 0
         try:
             for chunk, _meta in self.agent.stream(
                 {"messages": [user_msg]},
@@ -380,9 +417,19 @@ class ReActAgentService:
                 config=cfg,
                 context=ctx,
             ):
+                # 第二道防线:工具内部的辅助模型调用(问题改写/上下文压缩)跑在 agent
+                # 的 RunnableConfig 上下文里,一旦它们的 invoke 没显式清空 callbacks,
+                # 其 token 就会被当成回答推给前端并落库。第一道防线在各调用处传
+                # config={"callbacks": []}(见 query_rewrite/rewriter.py、summarization_mw.py);
+                # 这里按 metadata.lc_source 再拦一次,保证将来漏传也不会漏到用户面前。
+                if _is_internal_chunk(_meta):
+                    skipped_internal += 1
+                    continue
                 if isinstance(chunk, AIMessageChunk) and isinstance(chunk.content, str) and chunk.content:
                     answer_parts.append(chunk.content)
                     yield chunk.content
+            if skipped_internal:
+                logger.debug(f"stream_output: 已跳过 {skipped_internal} 个内部辅助调用的流式分片")
         except Exception as e:
             logger.error(f"stream_output: agent 执行异常:{e}")
             err = _friendly_model_error(e)
